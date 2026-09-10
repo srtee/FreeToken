@@ -106,6 +106,9 @@ class EngineConfig:
         spec = get_model_spec(self.hf_config.architectures[0])
         parse_config = _load_attr(spec.module, spec.parse_config)
         model_config = parse_config(self.hf_config)
+        # GGUF configs carry their per-tensor type table on ``gguf_type_table``; the
+        # dense-factory ``quant`` field stays None (the family's convert_*_to_gguf
+        # replaces the dense layers with native GGUF ops right after construction).
         return replace(model_config, quant=checkpoint_quant_config(self.model_path, self.hf_config, spec))
 
     @property

@@ -50,7 +50,7 @@ def _tensor_types(model_path: str) -> dict:
         if name.startswith("blk."):
             parts = name.split(".")
             layer = int(parts[1])
-            suffix = parts[2]
+            suffix = ".".join(parts[2:])
 
             if suffix == "attn_q.weight":
                 types.setdefault("attn_q", {})
@@ -75,6 +75,7 @@ def _tensor_types(model_path: str) -> dict:
                 types["ffn_down"][layer] = t.ggml_type
 
     types.setdefault("qkv_bias", False)
+    return types
 
 
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
@@ -109,6 +110,9 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
             rotary_dim=head_dim,
             max_position=max_pos,
             base=float(g("rope.freq_base")),
+            # llama.cpp carries no rope-scaling extension here (linear/yarn would appear
+            # as rope.scaling.* KV); plain default rope.
+            scaling=None,
         ),
         num_experts=0,
         num_experts_per_tok=0,
@@ -118,7 +122,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         architectures=list(shim.architectures),
         weight_format="gguf",
         has_attn_bias=True,
-        quant=_tensor_types(shim.model_path),
+        gguf_type_table=_tensor_types(shim.model_path),
     )
 
 
@@ -148,15 +152,15 @@ def iter_gguf_weights(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield (param_name, tensor) for every qwen2 param from a GGUF file.
 
-    Quantized projections keep their packed block layout (``.qweight``); q/k/v
-    and gate/up are fused by concatenating packed rows along the output dim.
-    Attention biases are dequantized and concatenated alongside.
+    Quantized projections keep their packed block layout (``.qweight``). q/k/v and
+    gate/up fuse by concatenating packed rows along the output dim when the shards
+    share one ggml type; mixed-type checkpoints (Q3_K_M: q/k Q3_K, v Q4_K/Q5_K)
+    yield the qkv shards separately for a ``GGUFSplitQKV``.
     """
     from freetoken.models.gguf.reader import iter_gguf_tensors
 
     from freetoken.utils import cached_load_hf_config
 
-    assert not include_moe_experts
     assert include_non_moe
     _require_tp1("weight loading")
 
@@ -216,10 +220,21 @@ def iter_gguf_weights(
 
         slots = qkv_buf.get(layer)
         if slots is not None and all(k in slots for k in ("q", "k", "v")):
-            yield f"{base}.self_attn.qkv_proj.qweight", torch.cat(
-                [slots["q"], slots["k"], slots["v"]], dim=0
-            )
-            del qkv_buf[layer]
+            types = config.gguf_type_table
+            qt, kt, vt = types["attn_q"][layer], types["attn_k"][layer], types["attn_v"][layer]
+            if qt == kt == vt:
+                # Uniform type: packed rows share row_bytes, concat into the fused tensor.
+                yield f"{base}.self_attn.qkv_proj.qweight", torch.cat(
+                    [slots["q"], slots["k"], slots["v"]], dim=0
+                )
+                del qkv_buf[layer]
+            else:
+                # Mixed types (Q3_K_M: q/k Q3_K, v Q4_K/Q5_K): packed rows have different
+                # widths, so the shards stay separate for a GGUFSplitQKV.
+                yield f"{base}.self_attn.qkv_proj.q_proj.qweight", slots["q"]
+                yield f"{base}.self_attn.qkv_proj.k_proj.qweight", slots["k"]
+                yield f"{base}.self_attn.qkv_proj.v_proj.qweight", slots["v"]
+                del qkv_buf[layer]
         gu = gate_up_buf.get(layer)
         if gu is not None and all(k in gu for k in ("gate", "up")):
             yield f"{base}.mlp.gate_up_proj.qweight", torch.cat(
@@ -228,9 +243,16 @@ def iter_gguf_weights(
             del gate_up_buf[layer]
         bb = bias_buf.get(layer)
         if bb is not None and all(k in bb for k in ("q", "k", "v")):
-            yield f"{base}.self_attn.qkv_proj.bias", torch.cat(
-                [bb["q"], bb["k"], bb["v"]], dim=0
-            )
+            types = config.gguf_type_table
+            qt, kt, vt = types["attn_q"][layer], types["attn_k"][layer], types["attn_v"][layer]
+            if qt == kt == vt:
+                yield f"{base}.self_attn.qkv_proj.bias", torch.cat(
+                    [bb["q"], bb["k"], bb["v"]], dim=0
+                )
+            else:
+                yield f"{base}.self_attn.qkv_proj.q_proj.bias", bb["q"]
+                yield f"{base}.self_attn.qkv_proj.k_proj.bias", bb["k"]
+                yield f"{base}.self_attn.qkv_proj.v_proj.bias", bb["v"]
             del bias_buf[layer]
 
     assert not qkv_buf, f"incomplete qkv groups: {sorted(qkv_buf)}"
@@ -247,12 +269,12 @@ def convert_qwen2_to_gguf(model, config: ModelConfig) -> None:
     """In place: replace qwen2's dense projections + embedding with native GGUF ops.
 
     Types come from the per-tensor table parse_gguf_config stashed in
-    ``config.quant`` (Q3_K_M-style mixed quants quantize tensors individually).
+    ``config.gguf_type_table`` (Q3_K_M-style mixed quants quantize tensors individually).
     """
-    from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear
+    from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear, GGUFSplitQKV
     from freetoken.layers.gguf import GGUFTiedLMHead, GGUFUntiedLMHead
 
-    types = config.quant
+    types = config.gguf_type_table
 
     embed_type = types["token_embd"]
     model.model.embed_tokens = GGUFEmbedding(
@@ -262,8 +284,24 @@ def convert_qwen2_to_gguf(model, config: ModelConfig) -> None:
     )
     for layer in model.model.layers.op_list:
         lid = layer._layer_id
+        attn = layer.self_attn
+        qt, kt, vt = types["attn_q"][lid], types["attn_k"][lid], types["attn_v"][lid]
+        has_bias = attn.qkv_proj.bias is not None
+        if qt == kt == vt:
+            qtype = types["attn_q"][lid]
+            out_features, in_features = attn.qkv_proj.weight.shape
+            attn.qkv_proj = GGUFLinear(
+                in_features, out_features, qtype, has_bias=has_bias,
+            )
+        else:
+            attn.qkv_proj = GGUFSplitQKV(
+                config.hidden_size,
+                attn.qo_attn_dim,
+                attn.kv_attn_dim,
+                qt, kt, vt,
+                has_bias=has_bias,
+            )
         for owner, attr, type_key in (
-            (layer.self_attn, "qkv_proj", "attn_q"),
             (layer.self_attn, "o_proj", "attn_output"),
             (layer.mlp, "gate_up_proj", "ffn_gate"),
             (layer.mlp, "down_proj", "ffn_down"),

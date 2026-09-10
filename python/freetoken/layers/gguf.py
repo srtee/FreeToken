@@ -21,7 +21,14 @@ from freetoken.models.gguf.dequant import (
     GGML_F16,
     GGML_F32,
     GGML_NAME,
+    GGML_Q2_K,
+    GGML_Q3_K,
     GGML_Q4_0,
+    GGML_Q4_1,
+    GGML_Q4_K,
+    GGML_Q5_0,
+    GGML_Q5_1,
+    GGML_Q5_K,
     GGML_Q6_K,
     GGML_Q8_0,
     row_bytes,
@@ -29,12 +36,17 @@ from freetoken.models.gguf.dequant import (
 
 from .base import BaseOP
 
-# ggml type groups for kernel dispatch (subset we build kernels for).
+# ggml type groups for kernel dispatch (everything the vendored kernels build).
 _UNQUANTIZED = {GGML_F32, GGML_F16, GGML_BF16}
-# standard + k-quants: both an MMVQ (small-batch GEMV) and MMQ (large-batch) kernel exist.
-_MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_DEQUANT = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
+# Quant types with both an MMVQ (small-batch GEMV) and an MMQ (large-batch) kernel:
+# the scalar quants Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 and the K-quants Q2_K..Q6_K.
+_MMVQ = {GGML_Q4_0, GGML_Q4_1, GGML_Q5_0, GGML_Q5_1, GGML_Q8_0,
+         GGML_Q2_K, GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K}
+_MMQ = _MMVQ
+_DEQUANT = _MMQ
+# iq* types: MMVQ + dequant kernels only (no MMQ in the vendored source); small
+# batches take MMVQ, large batches fall through to the dequant-then-matmul path.
+_IQ_TYPES = {16, 17, 18, 19, 20, 21, 22, 23, 29}
 
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
 _MMVQ_SAFE = 6
@@ -57,7 +69,9 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
     if qweight_type in _MMQ:
         return ggml_mul_mat_a8(qweight, x, qweight_type, out_features)
-    if qweight_type in _DEQUANT:
+    if qweight_type in _DEQUANT or qweight_type in _IQ_TYPES:
+        # _DEQUANT types reach here only for batches above the MMQ crossover;
+        # iq* types have no MMQ at all and always dequantize at large batch.
         block, type_size = BLOCK_SHAPE[qweight_type]
         in_features = qweight.shape[1] // type_size * block
         weight = ggml_dequantize(qweight, qweight_type, out_features, in_features, x.dtype)
@@ -86,6 +100,35 @@ class GGUFLinear(BaseOP):
         if self.bias is not None:
             out = out + self.bias
         return out
+
+
+
+class GGUFSplitQKV(BaseOP):
+    """q/k/v attention projection for GGUF checkpoints whose shards quantize with
+    *different* ggml types (Q3_K_M: q/k = Q3_K, v = Q4_K/Q5_K). Packed-row fusion into a
+    single ``qweight`` requires one type per fused tensor, so mixed checkpoints keep three
+    ``GGUFLinear`` shards; uniform checkpoints keep the fused path. Same duck type as the
+    fused projection: ``forward(x) -> [tokens, qo + 2*kv]`` (the caller splits by dims).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        q_out: int,
+        kv_out: int,
+        q_type: int,
+        k_type: int,
+        v_type: int,
+        has_bias: bool = False,
+    ):
+        self.q_proj = GGUFLinear(in_features, q_out, q_type, has_bias=has_bias)
+        self.k_proj = GGUFLinear(in_features, kv_out, k_type, has_bias=has_bias)
+        self.v_proj = GGUFLinear(in_features, kv_out, v_type, has_bias=has_bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.cat(
+            [self.q_proj.forward(x), self.k_proj.forward(x), self.v_proj.forward(x)], dim=-1
+        )
 
 
 class GGUFEmbedding(BaseOP):
@@ -155,7 +198,7 @@ class GGUFTiedLMHead:
         return fused_mul_mat_gguf(x, self._embedding.qweight, self._quant_type)
 
 
-class GGUFUntiedLMHead:
+class GGUFUntiedLMHead(BaseOP):
     """Untied LM head over a native block-quant weight (logits via ggml matmul).
 
     Same interface as GGUFTiedLMHead but owns its packed qweight; the loader
@@ -167,7 +210,9 @@ class GGUFUntiedLMHead:
         self.qweight = torch.empty(out_features, row_bytes(in_features, quant_type), dtype=torch.uint8)
 
     def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False):
-        pass
+        item = state_dict.pop(f"{prefix}.qweight", None)
+        assert item is not None and item.shape == self.qweight.shape and item.dtype == self.qweight.dtype
+        self.qweight = item
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from freetoken.core import get_global_ctx
@@ -179,4 +224,4 @@ class GGUFUntiedLMHead:
         return fused_mul_mat_gguf(x, self.qweight, self._quant_type)
 
 
-__all__ = ["GGUFLinear", "GGUFEmbedding", "GGUFTiedLMHead", "GGUFUntiedLMHead", "fused_mul_mat_gguf"]
+__all__ = ["GGUFLinear", "GGUFSplitQKV", "GGUFEmbedding", "GGUFTiedLMHead", "GGUFUntiedLMHead", "fused_mul_mat_gguf"]
