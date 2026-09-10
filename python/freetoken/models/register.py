@@ -69,6 +69,19 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen2ForCausalLM",
         packed_modules_mapping=_DENSE_PACKED,
     ),
+    # GGUF (native block-quant) dense adapters: same model classes, GGUF config + weight loaders.
+    "LlamaGGUFForCausalLM": ModelSpec(
+        "freetoken.models.llama",
+        "LlamaForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
+    "Qwen2GGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen2",
+        "Qwen2ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     "Qwen3ForCausalLM": ModelSpec(
         "freetoken.models.qwen3",
         "Qwen3ForCausalLM",

@@ -22,6 +22,7 @@ from freetoken.models.config import (
     RotaryConfig,
     SWAAttentionGroupConfig,
 )
+from freetoken.layers.gguf import GGUFTiedLMHead
 from freetoken.models.gguf.dequant import GGML_Q4_0, GGML_Q6_K, dequantize, row_bytes
 
 if TYPE_CHECKING:
@@ -114,6 +115,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         moe_enabled=True,
         expert_quant="q4_0",
         moe_weight_format="q4_0",
+        weight_format="gguf",
         use_qk_norm=True,
         attn_sm_scale=1.0,
         final_logit_softcapping=float(g("final_logit_softcapping")),
@@ -305,36 +307,7 @@ def iter_gguf_weights(
 
 def is_gguf_model(config: ModelConfig) -> bool:
     """True when the model was parsed from a GGUF checkpoint (native-quant path)."""
-    return getattr(config, "moe_weight_format", None) == "q4_0"
-
-
-class GGUFTiedLMHead:
-    """Tied LM head over a native Q6_K embedding table (logits via ggml matmul).
-
-    Holds only a reference to the GGUF embedding (no params of its own -> empty
-    state_dict), mirroring ``ParallelLMHead`` with ``tie_word_embeddings``. TP=1 only.
-    """
-
-    def __init__(self, embedding, quant_type: int):
-        self._embedding = embedding
-        self._quant_type = quant_type
-
-    def state_dict(self, *, prefix: str = "", result=None):
-        return result if result is not None else {}
-
-    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False):
-        state_dict.pop(f"{prefix}.weight", None)
-        state_dict.pop(f"{prefix}.bias", None)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from freetoken.core import get_global_ctx
-        from freetoken.layers.gguf import fused_mul_mat_gguf
-
-        batch = get_global_ctx().batch
-        if batch.is_prefill:
-            indices = batch.attn_metadata.get_last_indices(batch.size)
-            x = x[indices].contiguous()
-        return fused_mul_mat_gguf(x, self._embedding.qweight, self._quant_type)
+    return getattr(config, "weight_format", None) == "gguf"
 
 
 def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:

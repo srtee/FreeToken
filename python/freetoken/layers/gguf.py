@@ -125,4 +125,58 @@ class GGUFEmbedding(BaseOP):
         return y
 
 
-__all__ = ["GGUFLinear", "GGUFEmbedding", "fused_mul_mat_gguf"]
+
+
+class GGUFTiedLMHead:
+    """Tied LM head over a native block-quant embedding table (logits via ggml matmul).
+
+    Holds only a reference to the GGUF embedding (no params of its own -> empty
+    state_dict). TP=1 only.
+    """
+
+    def __init__(self, embedding, quant_type: int):
+        self._embedding = embedding
+        self._quant_type = quant_type
+
+    def state_dict(self, *, prefix: str = "", result=None):
+        return result if result is not None else {}
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False):
+        state_dict.pop(f"{prefix}.weight", None)
+        state_dict.pop(f"{prefix}.bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.core import get_global_ctx
+
+        batch = get_global_ctx().batch
+        if batch.is_prefill:
+            indices = batch.attn_metadata.get_last_indices(batch.size)
+            x = x[indices].contiguous()
+        return fused_mul_mat_gguf(x, self._embedding.qweight, self._quant_type)
+
+
+class GGUFUntiedLMHead:
+    """Untied LM head over a native block-quant weight (logits via ggml matmul).
+
+    Same interface as GGUFTiedLMHead but owns its packed qweight; the loader
+    fills it through the "lm_head.qweight" state-dict name. TP=1 only.
+    """
+
+    def __init__(self, in_features: int, out_features: int, quant_type: int):
+        self._quant_type = quant_type
+        self.qweight = torch.empty(out_features, row_bytes(in_features, quant_type), dtype=torch.uint8)
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False):
+        pass
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.core import get_global_ctx
+
+        batch = get_global_ctx().batch
+        if batch.is_prefill:
+            indices = batch.attn_metadata.get_last_indices(batch.size)
+            x = x[indices].contiguous()
+        return fused_mul_mat_gguf(x, self.qweight, self._quant_type)
+
+
+__all__ = ["GGUFLinear", "GGUFEmbedding", "GGUFTiedLMHead", "GGUFUntiedLMHead", "fused_mul_mat_gguf"]

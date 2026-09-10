@@ -174,6 +174,13 @@ def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
 def gguf_tensor_names(model_path: str) -> set[str]:
     return {t.name for t in _reader(model_path).tensors}
 
+def tensor_type_of(model_path: str, name: str) -> int | None:
+    """The ggml quant type of one named tensor, or None when absent."""
+    for t in iter_gguf_tensors(model_path):
+        if t.name == name:
+            return t.ggml_type
+    return None
+
 
 __all__ = [
     "is_gguf_path",
@@ -181,9 +188,9 @@ __all__ = [
     "OUTPUT_WEIGHT_PRESENT_KV",
     "gguf_config_source",
     "write_metadata_gguf",
-    "GgufTensor",
     "load_gguf_metadata",
     "gguf_architecture",
     "iter_gguf_tensors",
     "gguf_tensor_names",
+    "tensor_type_of",
 ]
