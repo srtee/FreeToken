@@ -424,7 +424,8 @@ class OffloadMoELayer(MoELayer):
 
             gate_up, down = views
             return fused_experts_gguf_q4_0(
-                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
+                down_qt=(cache.ggml_types or {}).get("down"),
             )
         raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
 

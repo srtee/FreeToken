@@ -92,6 +92,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen3MoeForCausalLM",
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
     ),
+    # GGUF (native block-quant) qwen3-moe adapter: same model classes, GGUF
+    # config + weight loaders. Routed experts ride the q4_0 offload-bank path.
+    "Qwen3MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_moe",
+        "Qwen3MoeForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     "MiniMaxM2ForCausalLM": ModelSpec(
         "freetoken.models.minimax_m2",
         "MiniMaxM2ForCausalLM",

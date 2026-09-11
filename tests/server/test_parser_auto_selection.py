@@ -34,11 +34,20 @@ NO_REASONING_FORMAT = {
     "MistralForCausalLM",
     "Mistral3ForConditionalGeneration",
     "Qwen2ForCausalLM",
+    # GGUF adapters reuse their dense sibling's tokenizer/parser behavior: the
+    # GGUF config shim surfaces the same metadata, so the cascade resolves the
+    # same way (llama GGUF -> no reasoning parser; qwen2/qwen3moe GGUF ->
+    # qwen25 tool / qwen3 reasoning).
+    "LlamaGGUFForCausalLM",
+    "Qwen2GGUFForCausalLM",
 }
 
 # `llama3` is the end of the cascade -- the answer when nothing matched.
 GENERIC_TOOL_CALL_FALLBACK = "llama3"
-NO_DEDICATED_TOOL_FORMAT = {"LlamaForCausalLM"}
+NO_DEDICATED_TOOL_FORMAT = {
+    "LlamaForCausalLM",
+    "LlamaGGUFForCausalLM",
+}
 
 
 class _Config:

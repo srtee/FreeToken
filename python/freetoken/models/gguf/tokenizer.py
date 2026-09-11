@@ -13,7 +13,12 @@ from typing import Any
 from .reader import gguf_architecture, load_gguf_metadata
 
 # GGUF architecture -> transformers GGUF tokenizer-converter key.
-_TOKENIZER_ARCH = {"gemma4": "gemma4_text"}
+_TOKENIZER_ARCH = {
+    "gemma4": "gemma4_text",
+    # transformers' converter registry keys on the HF model_type, not the
+    # llama.cpp arch string; qwen3moe shares the qwen2 tokenizer format.
+    "qwen3moe": "qwen2",
+}
 
 
 def load_gguf_tokenizer(model_path: str):

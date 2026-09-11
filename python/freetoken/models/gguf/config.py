@@ -20,6 +20,7 @@ GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "gemma4": "Gemma4GGUFForCausalLM",
     "llama": "LlamaGGUFForCausalLM",
     "qwen2": "Qwen2GGUFForCausalLM",
+    "qwen3moe": "Qwen3MoeGGUFForCausalLM",
 }
 
 

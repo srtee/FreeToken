@@ -26,6 +26,8 @@ def fused_experts_gguf_q4_0(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     activation: str,
+    *,
+    down_qt: int | None = None,  # ggml type of the down bank (default Q4_0)
 ) -> torch.Tensor:
     from freetoken.kernel.gguf import ggml_moe_a8_vec
 
@@ -37,13 +39,17 @@ def fused_experts_gguf_q4_0(
     n2 = gate_up_q.shape[1]  # 2 * intermediate
     h = down_q.shape[1]  # hidden
     top_k = topk_ids.shape[1]
+    # Per-role ggml types: plain q4_0 banks are (Q4_0, Q4_0); the qwen3moe
+    # conversions put Q4_1 on the down projection. The vendored ggml kernels
+    # dispatch on the type id (moe_vec_q4_0/q4_1_q8_1 both exist).
     qt = int(GGML_Q4_0)
+    qt_down = int(down_qt) if down_qt is not None else qt
 
     # gate_up: [num_tokens*top_k, 2I] -> activation -> [num_tokens*top_k, I]
     gate_up = ggml_moe_a8_vec(hidden_states, gate_up_q, topk_ids, top_k, qt, n2, num_tokens)
     inter = act_fn(gate_up)
     # down: each of the num_tokens*top_k intermediate rows uses its own expert id.
-    out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, qt, h, num_tokens * top_k)
+    out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, qt_down, h, num_tokens * top_k)
     out = out.reshape(num_tokens, top_k, h) * topk_weights.reshape(num_tokens, top_k, 1).to(
         out.dtype
     )

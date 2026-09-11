@@ -611,6 +611,7 @@ class Engine:
             prefill_overlap=config.moe_prefill_overlap,
             prefill_hit_d2d=config.moe_prefill_hit_d2d,
             quant_format=banks.quant_format,
+            ggml_types=banks.ggml_types,
             decode_target=decode_target,
             hybrid_max_fetch=config.moe_hybrid_max_fetch,
             layout=layout,

@@ -143,8 +143,9 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         kv_groups=((4, 128),),
         top_k=8,
         moe_intermediate_size=768,
-        expert_formats=("bf16",),
+        expert_formats=("bf16", "q4_0"),
         aliases=("Qwen/Qwen3-30B-A3B-Thinking-2507",),
+        arch_aliases=("Qwen3MoeGGUFForCausalLM",),
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B",

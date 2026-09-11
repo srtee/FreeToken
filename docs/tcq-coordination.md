@@ -220,3 +220,58 @@ Session A signing off. GPU free.
 Committing Session A's TCQ-KV work in 3 commits on gguf-serve. Sibling files
 (models/**, docs/mtp-plan.md, docs/wave3-part-a.md, docs/tcq-sessionB-review.md,
 tests/models/test_qwen3_moe_gguf.py, models/qwen3_moe/gguf.py) are NOT touched.
+
+## 2026-09-11T10:4xZ (Session B) — wave 3 part A + B complete in the working tree
+
+Implemented directly (coder delegation retired — see 09:5xZ note):
+- models/qwen3_moe/gguf.py: parse_gguf_config, iter_gguf_weights (fused/split
+  qkv + q/k-bias fusion + ffn_gate_inp -> mlp.gate), convert_qwen3moe_to_gguf
+  (dense-layer GGUF ops swap), load_q4_0_expert_sources (three-tensor gate/up/
+  down -> fused gate_up bank; asserts ggml_type Q4_0 per expert tensor),
+  dummy_q4_0_expert_sources.
+- models/qwen3_moe/model.py: GGUF convert hook (same pattern as qwen2/gemma4).
+- gguf/config.py + register.py + kernel/aot_models.py (registry key claim via
+  Qwen3-30B-A3B entry arch_aliases, expert_formats += "q4_0").
+- tests/models/test_qwen3_moe_gguf.py: 4 tests, all green.
+tests/models at 156 passed / 80 skipped (3 pre-existing failures unrelated to
+wave 3: AOT parity test's Llama/Qwen2 GGUF keys, muse_glimmer disk-quota,
+glm5_next_kda_snapshot collection error). NOT committed per ground rule 2.
+Remaining for wave 3: real-GGUF smoke (needs a Q4_0 qwen3moe GGUF; the local
+Qwen3.6-35B file is arch "qwen35moe" ggml-type-40 NVFP4 = wave 4 non-goal).
+
+## 2026-09-11T11:1xZ (Session B) — GPU CLAIM: real-GGUF smoke test
+
+Claiming exclusive GPU for the qwen3moe smoke test: downloading finished, I'm
+launching `ft serve` on the 17G unsloth Qwen3-30B-A3B-Q4_0 GGUF. Both servers
+(1918/1919) are currently down and GPU shows 150 MiB used. Expected duration:
+load + a few chat completions, tens of minutes. Object here within 5 min.
+
+## 2026-09-11T21:2xZ (Session B) — smoke test blocked on host RAM, not code
+
+qwen3moe Q4_0 smoke: all code-level failures fixed (Q4_0/Q4_1 mixed down
+experts normalized bit-exactly to Q4_1, tokenizer arch map added, adapter loads
+clean through the offload path). The load then ran 80 minutes (serial Q4_0
+read of a 17GB file + per-row Q4_0->Q4_1 upconvert + 15.8 GiB of host banks on
+a 30GB box) and the detokenizer worker died silently — SIGKILL-shaped, likely
+host-memory pressure (file mmap + banks + detokenizer's own 17GB mmap).
+Next attempts need either (a) FREETOKEN_DISABLE_JIT-style bank sizing check,
+(b) running with a smaller model, or (c) freeing the page cache first. The
+smoke test is the ONLY remaining wave-3 gate. GPU claim still stands.
+
+## 2026-09-11T21:5xZ (Session B) — wave 3 COMPLETE: real-GGUF smoke PASSED
+
+smoke test on the real 17GB unsloth Qwen3-30B-A3B-Q4_0.gguf (arch "qwen3moe",
+48 layers, 128 experts): served clean on :1918 with --moe-strategy offload,
+GPU 14.6 GiB. Coherent generation verified ("capital of France" -> "Paris",
+finish=stop). Fixes made during the smoke, all bit-exact or structural:
+1. The file MIXES down-expert types per layer (first 6 layers Q4_1, rest Q4_0)
+   -> normalized to Q4_1 at load via _q4_0_to_q4_1 (m = fp16(-8*d); verified
+   0.0 max diff on a real layer's 262144 rows vs the Q4_0 torch reference).
+2. Tokenizer: transformers' converter registry keys on HF model_type, added
+   "qwen3moe" -> "qwen2" in models/gguf/tokenizer.py.
+3. GGUFUntiedLMHead call had lost its vocab_size arg — restored.
+4. Bank sizing now derives from a per-role type probe pass (gate/up uniform
+   asserted, down mixed accepted and normalized).
+All wave-3 tests green: 119 passed (qwen3moe gguf + registry + moe suites).
+GPU released. NOT committed (per ground rule 2 — wave boundary commit is
+Session A's call to coordinate).

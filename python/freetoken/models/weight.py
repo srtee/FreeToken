@@ -259,14 +259,20 @@ def load_q4_0_moe_expert_sources(
     *,
     dummy: bool = False,
     layer_sink=None,
-) -> dict:
+) -> tuple[dict, dict[str, int]]:
     """Load (or fabricate, with ``dummy=True``) packed GGUF Q4_0 expert source banks.
-    ``layer_sink`` (converter) streams each completed layer's banks; ignored for dummy."""
+
+    Returns ``(sources, ggml_types)``: the per-layer bank dict plus each role's
+    ggml quant type (uniform per role across layers; qwen3moe mixes Q4_0
+    gate/up with a Q4_1 down). ``layer_sink`` (converter) streams each completed
+    layer's banks; ignored for dummy."""
     _config, spec = _spec_for_model_path(model_path)
     if dummy:
+        from .gguf.dequant import GGML_Q4_0
+
         builder = _model_override(spec, "dummy_q4_0_expert_sources")
         assert builder is not None, "model defines no dummy_q4_0_expert_sources"
-        return builder(model_config)
+        return builder(model_config), {"gate_up": GGML_Q4_0, "down": GGML_Q4_0}
     loader = _load_attr(spec.module, "load_q4_0_expert_sources")
     return loader(model_path, model_config, layer_sink=layer_sink)
 

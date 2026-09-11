@@ -121,6 +121,10 @@ class OffloadMoeCache:
     # prefill). The format names its bank layout (_BANK_SCHEMAS) and which kernels
     # may read the banks; the cache machinery itself is layout-agnostic.
     quant_format: str = "bf16"
+    # Per-bank ggml quant type ids for the GGUF "q4_0" format (qwen3moe mixes
+    # Q4_0 gate/up with Q4_1 down); None or absent keys mean Q4_0. Read by the
+    # fused MoE kernel dispatch in layers/moe.py.
+    ggml_types: dict[str, int] | None = None
     # Decode mode + bank layout; per-layer CPU routing is cpu_layer_ids. "gpu":
     # GPU-tiled banks, all decode on GPU (stream misses over PCIe into the slot
     # cache, GEMM on GPU). "cpu": native (CPU-readable) banks + a CPU executor;

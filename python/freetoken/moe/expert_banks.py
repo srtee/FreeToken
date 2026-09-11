@@ -38,6 +38,9 @@ class ExpertBanks:
     # marlin/b12x per-expert global scales ([L*E]); None for formats without them
     gate_up_alpha: torch.Tensor | None = field(default=None)
     down_alpha: torch.Tensor | None = field(default=None)
+    # per-bank ggml quant type (GGUF formats only): {role: type_id} when the
+    # file mixes types across banks (qwen3moe: gate/up Q4_0, down Q4_1).
+    ggml_types: dict[str, int] | None = field(default=None)
     # per-layer HostResidency values actually applied by the loader; None -> all pinned (also the degrade signal when a request was not honored)
     layer_residency: list[str] | None = field(default=None)
     # True iff the ``layer_sink`` passed to the loader was actually engaged (each layer
@@ -166,9 +169,14 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     # per-layer HostBanks (pin-after-fill), so conversion streams each completed layer's
     # gate_up + down straight through the sink (dummy fabricates in one shot -> not streamed).
     sink = None if dummy else layer_sink
-    sources = load_q4_0_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
+    sources, ggml_types = load_q4_0_moe_expert_sources(
+        model_path, model_config, dummy=dummy, layer_sink=sink
+    )
     return ExpertBanks(
-        "q4_0", {name: sources[name] for name in _BANK_SCHEMAS["q4_0"]}, streamed=sink is not None
+        "q4_0",
+        {name: sources[name] for name in _BANK_SCHEMAS["q4_0"]},
+        ggml_types=ggml_types,
+        streamed=sink is not None,
     )
 
 
