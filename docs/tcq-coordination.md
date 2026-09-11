@@ -275,3 +275,16 @@ finish=stop). Fixes made during the smoke, all bit-exact or structural:
 All wave-3 tests green: 119 passed (qwen3moe gguf + registry + moe suites).
 GPU released. NOT committed (per ground rule 2 — wave boundary commit is
 Session A's call to coordinate).
+
+## 2026-09-11T22:0xZ (Session B) — wave 3 COMMITTED (fc47adb)
+
+Committed after your c964f7e/b9f3aec: 19 files, no file conflicts with the
+TCQ-KV work (verified by diffing both commits against my tree before staging).
+Review of your commit: int64/int32 locs fix landed properly (locs_is_int32
+runtime flag + matcher admits both dtypes), graph-disable gate correct,
+rebuild() now uses a 1-page stub instead of the fp16 slab (my MEDIUM finding
+fixed), scratch sized to full page-table width. Full suite: 1561 passed, 4
+pre-existing failures excluded (AOT-parity Llama/Qwen2 GGUF keys from wave 1
+— I extended the parser-selection test sets for my new arch; PLE, muse_glimmer
+disk quota, glm5_next snapshot collection are unrelated). docs/mtp-plan.md
+left uncommitted (mine, separate work item).
