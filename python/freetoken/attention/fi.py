@@ -218,8 +218,19 @@ class FlashInferBackend(BaseAttnBackend):
         assert isinstance(metadata, FIMetadata)
         self._initialize_metadata_once(metadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
-        kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
-        kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
+        pool = self.kvcache
+        if getattr(pool, "is_turbo", False):
+            k_m, v_m = pool.materialize(layer_id, metadata.indices, metadata.seq_lens_cpu)
+            # scratch is (n_rows, heads, 128) in the pool's input dtype: view
+            # as flashinfer's page=1 layout. No cast needed — the dequant kernel
+            # emits the model dtype directly, matching the plan's kv_data_type.
+            kv_cache = (
+                k_m.view(-1, 1, k_m.shape[1], 128),
+                v_m.view(-1, 1, v_m.shape[1], 128),
+            )
+        else:
+            kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
+            kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
         return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
 
     def prepare_metadata(self, batch: Batch) -> None:

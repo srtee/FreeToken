@@ -84,6 +84,11 @@ class EngineConfig:
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
+    # KV storage codec: f16 (default) or a TurboQuant/TCQ packed codec
+    # (turbo8 8.125 bpv, turbo4 4.125 bpv, turbo3_tcq 3.25 bpv, turbo2_tcq
+    # 2.25 bpv). Non-f16 requires head_dim=128, page_size=1, and the
+    # materializer path in the attention backend.
+    kv_codec: str = "f16"
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None

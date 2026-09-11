@@ -755,6 +755,7 @@ def cache_geometry(state: Any) -> dict:
         ub = getattr(state, "unit_bytes", None) or {}
         unit_bytes = {
             "kv_per_token": int(ub.get("kv_bytes_per_token", 0) or 0),
+            "kv_codec": getattr(config, "kv_codec", "f16"),
             "moe_per_expert": int(ub.get("moe_bytes_per_expert", 0) or 0),
             "mamba_per_slot": int(ub.get("mamba_bytes_per_slot", 0) or 0),
             "swa_per_token": int(ub.get("swa_bytes_per_token", 0) or 0),

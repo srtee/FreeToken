@@ -312,7 +312,7 @@ class Engine:
         # KV pool family fixed at construction from the model config: its classmethods own the
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
-        self._pool_cls = resolve_pool_class(config.model_config)
+        self._pool_cls = resolve_pool_class(config.model_config, kv_codec=config.kv_codec)
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
