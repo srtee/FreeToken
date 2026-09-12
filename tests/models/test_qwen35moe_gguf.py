@@ -465,3 +465,67 @@ def test_unmapped_tensor_raises(tiny_gguf):
     with pytest.raises(ValueError, match="unmapped qwen35moe"):
         list(iter_gguf_weights(bad + ".tmp", None, include_moe_experts=False,
                                include_non_moe=True))
+
+def test_gdn_v_head_permutation_matches_checkpoint_pairing(tiny_gguf):
+    """The checkpoint pairs GDN v-head m with k/q-head m % num_k_heads
+    (block layout), while the engine's fla kernels pair v-head j with
+    k-head j // (HV/HK) (interleave). iter_gguf_weights must permute
+    every v-head-indexed segment by pi(j) = j//g + HK*(j%g) so the
+    interleave kernels read the checkpoint's pairing. Verified against
+    llama.cpp layer-0 activations on the real checkpoint."""
+    from freetoken.models.qwen3_5_moe.gguf import iter_gguf_weights, parse_gguf_config, _shim_for
+
+    pairs = dict(iter_gguf_weights(tiny_gguf, None, include_moe_experts=False,
+                                   include_non_moe=True))
+    cfg = parse_gguf_config(_shim_for(tiny_gguf))
+    lg = cfg.linear_attention_group()
+    hv, hk = lg.num_value_heads, lg.num_key_heads
+    g = hv // hk
+    pi = [j // g + hk * (j % g) for j in range(hv)]
+
+    # Read the raw GGUF rows for a linear layer to compare against,
+    # dequantizing NVFP4 with the adapter's own row decoder.
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+    from freetoken.models.qwen3_5_moe.gguf import _dequant_nvfp4_rows, _side_scale
+    from freetoken.models.qwen3_5_moe.gguf import _nvfp4_global_for, _collect_side_scales
+    sides = _collect_side_scales(tiny_gguf)
+    raw = {}
+    for t in iter_gguf_tensors(tiny_gguf):
+        if t.name.startswith("blk.0.") and not t.name.endswith((".scale", ".input_scale")):
+            if t.ggml_type == 40:  # NVFP4
+                g = _nvfp4_global_for(t, sides.get(t.name, {}))
+                flat = _dequant_nvfp4_rows(t.packed().clone(), g).reshape(t.shape)
+            else:
+                from freetoken.models.gguf.dequant import dequantize
+                flat = dequantize(t.packed().reshape(-1), t.ggml_type, torch.bfloat16).reshape(t.shape)
+            raw[t.name] = flat.float()
+
+    l = 0  # linear layer in the tiny fixture
+    base = "model.layers.0"
+    in_proj = pairs[f"{base}.linear_attn.in_proj.weight"].float()
+    # fused order [conv_dim(qkv), value_dim(z), b, a]; qkv = q|k|v rows.
+    key_dim = lg.key_head_dim * lg.num_key_heads
+    v_off = 2 * key_dim
+    z_off = CONV_DIM
+    d = GDN_HEAD_DIM
+    # v rows: fused row block j == raw row block pi(j)
+    raw_qkv = raw["blk.0.attn_qkv.weight"]
+    for j in range(hv):
+        assert torch.equal(in_proj[v_off + j * d: v_off + (j + 1) * d],
+                           raw_qkv[v_off + pi[j] * d: v_off + (pi[j] + 1) * d])
+    # z rows likewise
+    raw_gate = raw["blk.0.attn_gate.weight"]
+    for j in range(hv):
+        assert torch.equal(in_proj[z_off + j * d: z_off + (j + 1) * d],
+                           raw_gate[pi[j] * d: (pi[j] + 1) * d])
+    # out_proj: input head-blocks permuted the same way.
+    out = pairs[f"{base}.linear_attn.out_proj.weight"].float()
+    raw_out = raw["blk.0.ssm_out.weight"]
+    for j in range(hv):
+        assert torch.equal(out[:, j * d: (j + 1) * d],
+                           raw_out[:, pi[j] * d: (pi[j] + 1) * d])
+    # q/k rows and the shared gated-norm weight are NOT permuted.
+    assert torch.equal(in_proj[:key_dim], raw_qkv[:key_dim])
+    assert torch.equal(in_proj[key_dim:2 * key_dim], raw_qkv[key_dim:2 * key_dim])
+    assert torch.equal(pairs[f"{base}.linear_attn.norm.weight"].float(),
+                       raw["blk.0.ssm_norm.weight"].float())
