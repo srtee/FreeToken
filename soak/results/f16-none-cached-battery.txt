@@ -1,0 +1,4 @@
+codec=f16 tune=none vram_mib=15092
+codec=f16 ctx=2048 wall_s=29.86
+codec=f16 ctx=8192 wall_s=56.72
+codec=f16 done

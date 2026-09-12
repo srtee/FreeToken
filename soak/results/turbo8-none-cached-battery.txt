@@ -1,0 +1,12 @@
+codec=turbo8 tune=none vram_mib=14852
+codec=turbo8 ctx=2048 wall_s=
+codec=turbo8 ctx=8192 wall_s=
+codec=turbo8 done
+codec=turbo8 tune=none vram_mib=14852
+codec=turbo8 ctx=2048 wall_s=26.40
+codec=turbo8 ctx=8192 wall_s=56.71
+codec=turbo8 done
+codec=turbo8 tune=none vram_mib=14852
+codec=turbo8 ctx=2048 wall_s=24.12
+codec=turbo8 ctx=8192 wall_s=28.34
+codec=turbo8 done

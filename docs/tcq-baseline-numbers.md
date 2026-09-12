@@ -18,7 +18,25 @@ temperature 0; VRAM sampled post-load. Run through the Slurm chain in
 | turbo3_tcq | 3.25 | 53248 | 4.92x |
 | turbo2_tcq | 2.25 | 36864 | 7.11x |
 
-## Server battery (measured)
+## Server battery — cache-busted rerun (2026-09-13, triton fused decode)
+
+32B IQ3_XXS, unique prompts per round (radix cache never short-circuits
+prefill), server+client pinned to E-cores 8-11 during the LAMMPS run.
+Warmup round discarded; second round measured.
+
+| Codec | VRAM MiB | 2K prefill+128 dec (s) | 8K prefill+128 dec (s) |
+|---|---|---|---|
+| f16 | 15092 | 29.86 | 56.72 |
+| turbo8 | 14852 | 24.12 | 28.34 |
+| turbo4 | 14332 | 24.20 | 28.52 |
+| turbo3_tcq | 14232 | 24.92 | 30.35 |
+
+turbo8 is 2.0x f16 at 8K (fused packed-slab decode + CUDA graphs vs the
+f16 kernel path) and 1.24x at 2K; VRAM tracks the compression table
+(turbo3 -860 MiB vs f16 on 8192 tokens). Decode dominates the 8K wall —
+the fused path is the win, not the codec's bandwidth alone.
+
+## (superseded 2026-09-13) Server battery (measured)
 
 | Codec | VRAM MiB (weights+KV 8192 tok) | 2K prefill+128 dec (s) | 8K prefill+128 dec (s) |
 |---|---|---|---|
