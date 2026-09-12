@@ -34,7 +34,14 @@ with prefill scaling; treat the battery wall-clock numbers as unreliable
 VRAM deltas track the compression table (turbo3: 13300 vs f16 14940 MiB =
 1.6 GiB saved on 8192 tokens ~= the predicted 172 KiB/token x 8192).
 
-## 30-min turbo3_tcq soak — RESOLVED (materializer page-id bug)
+## 30-min turbo3_tcq soak — PASS (2026-09-13 rerun on fixed path)
+
+31-min soak, 20 turns x 3 prompts, 32B IQ3_XXS: per-prompt outputs
+deterministic, lengths identical across every turn (780/698/485 chars),
+zero drift/decay/loops. Prior soak failure attributed to the materializer
+page-id bug (fixed in 73f2bff).
+
+## (historical) 30-min soak — RESOLVED (materializer page-id bug)
 
 **ROOT CAUSE FOUND AND FIXED** (commit after b72236f): `materialize()`
 dequantized rows COMPACTED into `scratch[:n]`, but the attention wrapper
