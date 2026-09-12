@@ -18,6 +18,8 @@ _TOKENIZER_ARCH = {
     # transformers' converter registry keys on the HF model_type, not the
     # llama.cpp arch string; qwen3moe shares the qwen2 tokenizer format.
     "qwen3moe": "qwen2",
+    # qwen3.5/3.6 (hybrid GDN) shares the qwen2 tokenizer format too.
+    "qwen35moe": "qwen2",
 }
 
 

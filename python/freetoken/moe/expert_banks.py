@@ -180,14 +180,40 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
+# GGUF NVFP4 experts (qwen35moe): GGML NVFP4 blocks -> the offload cache's
+# native "nvfp4" bank layout (packed nibbles + fp8 block scales + fp16
+# per-row globals). Only for GGUF checkpoints (weight_format == "gguf").
+def _nvfp4_gguf_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    if parallel:
+        raise NotImplementedError("parallel reader not implemented for GGUF NVFP4 (single packed file)")
+    from freetoken.models.qwen3_5_moe.gguf import (
+        dummy_nvfp4_expert_sources,
+        load_nvfp4_expert_sources,
+    )
+    sources = (
+        dummy_nvfp4_expert_sources(model_config)
+        if dummy
+        else load_nvfp4_expert_sources(model_path, model_config)
+    )
+    return ExpertBanks("nvfp4", sources, streamed=False)
+
+
 # expert formats that still load through their own provider (GGUF)
 _PROVIDERS = {
     "q4_0": _q4_0_banks,
+    "nvfp4": _nvfp4_gguf_banks,
 }
 
 
 def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None) -> ExpertBanks:
     expert_quant = model_config.expert_quant
+    if expert_quant == "nvfp4" and getattr(model_config, "weight_format", None) != "gguf":
+        # Native ModelOpt NVFP4 checkpoints load through their MoE quant
+        # method (safetensors pieces), not the GGUF bank provider.
+        raise ValueError(
+            f"{expert_quant!r} experts load through their MoE quant method; "
+            f"only {sorted(_PROVIDERS)} still have a format provider"
+        )
     if expert_quant not in _PROVIDERS:
         raise ValueError(
             f"{expert_quant!r} experts load through their MoE quant method; "

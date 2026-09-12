@@ -100,6 +100,15 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
     ),
+    # GGUF (native NVFP4) hybrid GDN+attention MoE adapter: qwen3_5_moe model
+    # classes; dense tensors dequantize to bf16, routed experts ride the NVFP4
+    # offload banks converted from the GGML NVFP4 blocks.
+    "Qwen35MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5MoEForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     "MiniMaxM2ForCausalLM": ModelSpec(
         "freetoken.models.minimax_m2",
         "MiniMaxM2ForCausalLM",

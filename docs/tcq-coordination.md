@@ -288,3 +288,65 @@ pre-existing failures excluded (AOT-parity Llama/Qwen2 GGUF keys from wave 1
 — I extended the parser-selection test sets for my new arch; PLE, muse_glimmer
 disk quota, glm5_next snapshot collection are unrelated). docs/mtp-plan.md
 left uncommitted (mine, separate work item).
+
+
+## 2026-09-12T15:0xZ — qwen35moe GGUF adapter status (Session A)
+
+The qwen35moe (Qwen3.5/3.6 hybrid GDN+MoE) GGUF adapter is implemented and
+structurally verified:
+- models/qwen3_5_moe/gguf.py: parse_gguf_config (hybrid groups, GDN dims,
+  partial rope), iter_gguf_weights (dense NVFP4 dequant with per-tensor
+  globals, GDN in_proj fusion [qkv,z,b,a], pre-baked norm pass-through,
+  A_log = log(-rate) conversion), load_nvfp4_expert_sources (GGML NVFP4 ->
+  engine nvfp4 bank layout, element-order permutation verified exact vs
+  gguf-py).
+- Wiring: GGUF arch registry, ModelSpec, tokenizer map, _nvfp4_gguf_banks
+  provider, OffloadMoELayer nvfp4 branch, HostBank-native pinning (mlock —
+  cudaHostRegister at 18G scale kills the worker on both driver versions).
+- 7/7 synthetic tests green (tests/models/test_qwen35moe_gguf.py).
+- Bugs found & fixed: non-writable packed tensors (segfault), partial rope
+  (rope.dimension_count=64), pre-baked norms (GGUF stores 1+w; pass-through
+  not +1), ssm_a stores -exp(A_log) (convert log(-rate)).
+- UNRESOLVED: 35B outputs remain incoherent (first decode token often
+  plausible, then diverges). All static weight mappings now match
+  llama.cpp's src/models/qwen35moe.cpp line-by-line (verified against the
+  vendored llama.cpp source, which serves the same GGUF coherently on
+  GPU+expert-offload). Ground-truth continuations captured:
+  "The capital of France is" -> " Paris, a city renowned for";
+  "1, 2, 3," -> " 4, 5,"; "def fibonacci(n):" -> "\n    if n <= ".
+- Next session: instrument per-layer activations (ft vs llama.cpp logits
+  on identical token prefixes) to find the diverging layer. Suspects:
+  engine GDN decode state handoff, conv state layout, or the fused MoE
+  global-scale application path. Serving quirks: --cuda-graph-max-bs 0
+  required (capture illegal access); mlock banks need `ulimit -l
+  unlimited` (systemd override installed); driver downgraded to 595.58.03
+  (UVM bad-page-state taint on .91.07 wedges VRAM on worker crashes).
+
+
+## 2026-09-12T17:3xZ — RESOLVED: qwen35moe GDN output incoherence (Session A)
+
+ROOT CAUSE: GQA head-order mismatch in the GDN layers. The checkpoint's
+GDN v-heads pair with q/k-heads BLOCK-style (v-head m <-> k-head
+m % num_k_heads), while the engine's fla kernels pair them INTERLEAVE
+(v-head j <-> k-head j // (HV/HK)). With identical, verified inputs
+(conv/q/k/v/gate/beta all cos=1.0 vs llama.cpp), ft's scan matched a
+pure-torch reference exactly but llama.cpp's scan differed (cos 0.68,
+norms 1.12 vs 1.55). Recomputing the reference with the block mapping
+reproduced llama.cpp EXACTLY (cos 1.0).
+
+FIX: gguf.py iter_gguf_weights now permutes every v-head-indexed GDN
+weight segment by pi(j) = j//g + HK*(j%g): the v rows of attn_qkv, the
+z rows of attn_gate, ssm_beta/ssm_alpha rows, ssm_a and ssm_dt.bias,
+the input head-blocks of ssm_out (dim=1), and the v channels of
+ssm_conv1d. q/k rows and the shared ssm_norm stay untouched. After the
+fix the model is coherent and matches llama.cpp ground truth on most
+prefixes ("1, 2, 3," -> " 4, 5" exact; "def fibonacci(n):" -> "\n
+if n <=" exact; "The capital of France is" -> " Paris." vs llama's
+" Paris," — bf16 near-tie).
+
+METHOD (reusable): eval-callback layer dump patched into vendored
+llama.cpp (LLAMA_DUMP_LAYERS=<dir> env; llama-context.cpp; dumps
+l_out-N, attn_residual-N, ffn_moe_out-N, ffn_moe_weights_norm-N,
+attn_output-N, gate-N, conv_output_silu-N etc.); env-gated dump hooks
+in ft (model.py/moe.py/gdn.py, since removed). scripts/logit_probe.py
+added for ft-vs-llama greedy/logprob comparison.

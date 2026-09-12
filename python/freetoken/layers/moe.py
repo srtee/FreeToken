@@ -427,7 +427,37 @@ class OffloadMoELayer(MoELayer):
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
                 down_qt=(cache.ggml_types or {}).get("down"),
             )
-        raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
+        if fmt == "nvfp4":
+            # GGUF NVFP4 experts (qwen35moe adapter): the banks already use the
+            # native ModelOpt row layout, so run the same Triton kernels the
+            # quant-method path uses, over the slot views.
+            from freetoken.moe.fused_nvfp4 import (
+                fused_experts_decode_nvfp4_marlin,
+                fused_experts_nvfp4,
+            )
+
+            view = ExpertView(
+                {
+                    role: t
+                    for role, t in zip(cache.bank_schema, views)
+                },
+                slots=None if n is not None else topk_ids, n=n, alphas=alphas,
+            )
+            t = view.tensors
+            banks = (
+                t["gate_up_packed"], t["gate_up_scale"], t["gate_up_global"],
+                t["down_packed"], t["down_scale"], t["down_global"],
+            )
+            if is_prefill:
+                return fused_experts_nvfp4(
+                    hidden_states, *banks, topk_weights, topk_ids, view.n,
+                    self.activation, self.apply_router_weight_on_input,
+                )
+            return fused_experts_decode_nvfp4_marlin(
+                hidden_states, *banks, topk_weights, topk_ids,
+                self.activation, self.apply_router_weight_on_input,
+            )
+        raise AssertionError(f"offload experts without a quant method only serve q4_0/nvfp4 banks, got {fmt!r}")
 
 
 def make_moe_layer(
