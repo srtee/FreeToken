@@ -154,6 +154,11 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
     pools = {
         "num_pages": 0, "page_size": 0, "moe_cache_size": 0, "num_mamba_slots": 0,
         "swa_page_size": 0, "num_swa_pages": 0,
+        # KV storage codec identity + InnerQ calibration outcome (static at
+        # load: the calibration window closes after the first ~2048 stored
+        # tokens, so this is False at readiness unless disabled/balanced
+        # pre-store; the desktop labels the pool with it).
+        "kv_codec": "f16", "kv_codec_tune": "none", "innerq_calibrated": False,
     }
     try:
         config = engine.config
@@ -179,6 +184,12 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
         lsp = engine.linear_state_pool
         if lsp is not None:
             pools["num_mamba_slots"] = max(0, int(lsp.num_slots or 0) - 1)
+        pool = engine.kv_cache
+        pools["kv_codec"] = str(getattr(pool, "codec", "f16") or "f16")
+        if config is not None:
+            pools["kv_codec_tune"] = str(getattr(config, "kv_codec_tune", "none") or "none")
+        if getattr(pool, "is_turbo", False):
+            pools["innerq_calibrated"] = bool(getattr(pool, "innerq_calibrated", False))
     except Exception:  # noqa: BLE001 -- best-effort; readiness must not depend on this
         pass
     return pools

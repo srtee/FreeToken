@@ -781,6 +781,14 @@ def cache_geometry(state: Any) -> dict:
         # Eviction policy of the MoE slot cache ("lru"). Reported so a client can label the
         # pool without having to know how the server was started.
         "moe_cache_policy": getattr(config, "moe_cache_policy", None),
+        # KV storage codec identity + InnerQ tune: the flags that built the pool (static for
+        # the server's lifetime), so clients can label the KV pool without probing the CLI.
+        # innerq_calibrated is the load-time pools-meta snapshot (the calibration window
+        # closes after the first ~2048 stored tokens, so it reads False until the next
+        # meta snapshot); the tune flag is the reliable "feature is on" signal.
+        "kv_codec": getattr(config, "kv_codec", "f16") or "f16",
+        "kv_codec_tune": getattr(config, "kv_codec_tune", "none") or "none",
+        "innerq_calibrated": bool((getattr(state, "cache_pools", None) or {}).get("innerq_calibrated", False)),
         "unit_bytes": unit_bytes,
         "swa_full_tokens_ratio": swa_full_tokens_ratio,
         # The window pool's page unit for num_swa_pages: DSV4 = P (== page_size), radix-SWA = 1

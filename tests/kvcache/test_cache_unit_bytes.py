@@ -268,6 +268,11 @@ def test_compute_cache_pools_reads_load_time_allocations():
         "num_mamba_slots": 64,
         "swa_page_size": 0,
         "num_swa_pages": 0,
+        # f16 defaults: the fake engine's kv_cache (a plain Namespace) has
+        # no codec/is_turbo attributes, so the codec fields degrade to f16.
+        "kv_codec": "f16",
+        "kv_codec_tune": "none",
+        "innerq_calibrated": False,
     }
 
 
@@ -282,6 +287,9 @@ def test_compute_cache_pools_zero_for_missing_pools():
         "num_mamba_slots": 0,
         "swa_page_size": 0,
         "num_swa_pages": 0,
+        "kv_codec": "f16",
+        "kv_codec_tune": "none",
+        "innerq_calibrated": False,
     }
 
 

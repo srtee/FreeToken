@@ -70,7 +70,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | `--memory-ratio` | 0.9 | Fraction of free VRAM the engine may use (weights + MoE cache + KV) |
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
-| `--kv-codec` | f16 | KV storage codec: `f16` (stock slabs) or `turbo8`/`turbo4`/`turbo3_tcq`/`turbo2_tcq` — TurboQuant packed storage (FWHT rotation + scalar or TCQ trellis quantization) at 8.125/4.125/3.25/2.25 bits per value. Requires head_dim = multiple of 128 (a 256-dim head stores two rotation groups), page_size=1; reads go through a dequantizing materializer. Quality: turbo8 near-lossless at any model scale; turbo4/turbo3_tcq are calibrated on 27B+ — on 14B-class models prefer turbo8 |
+| `--kv-codec` | f16 | KV storage codec: `f16` (stock slabs) or `turbo8`/`turbo4`/`turbo3_tcq`/`turbo2_tcq` — TurboQuant packed storage (FWHT rotation + scalar or TCQ trellis quantization) at 8.125/4.125/3.25/2.25 bits per value. Requires head_dim == 128, page_size=1; reads go through a dequantizing materializer. Quality: turbo8 near-lossless at any model scale; turbo4/turbo3_tcq are calibrated on 27B+ — on 14B-class models prefer turbo8 |
 | `--kv-codec-tune` | none | Per-channel KV equalization (InnerQ): `innerq` calibrates K/V scales over the first ~2048 stored tokens, then equalizes channels before quantization and unscales at the materializer. Requires a non-f16 `--kv-codec` |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
@@ -158,6 +158,10 @@ fast-load format; point `ft serve --model` at the output dir. `--moe-backend
 offload` (default) packs experts into offload banks; `--moe-backend triton`
 keeps them dense for resident serving. See the FTW caveats in
 [models.md](models.md#notes).
+
+FTW files carry weights (and offload expert banks) only — the KV storage codec
+is runtime-only (`--kv-codec`), so a converted checkpoint serves quantized KV
+without reconversion.
 
 ## ft bench bw
 

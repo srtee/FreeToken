@@ -217,3 +217,42 @@ def test_pool_calibration_state_machine():
     finally:
         TurboKVCache.CALIBRATION_TOKENS = 2048
         turbo_kv.innerq_upload_scales(codec, torch.ones(128), torch.ones(128))
+
+
+@pytest.mark.gpu
+def test_tp_head_splitting_exact(codec):
+    """TP>1 splits the kv heads across ranks (MHAKVCache divides
+    num_kv_heads by tp via div_even); quantization is per-128-group and
+    never crosses heads, so quantizing two head-halves separately must
+    produce the same packed rows and dequantized values as quantizing
+    the full tensor and slicing. This pins the mechanism that makes TP
+    safe without any kernel changes."""
+    torch.manual_seed(7)
+    L, heads = 8, 4
+    k = (torch.randn(L, heads, 128, device="cuda") * 0.5).contiguous()
+    v = (torch.randn(L, heads, 128, device="cuda") * 0.5).contiguous()
+    bb = turbo_kv.CODEC_SPECS[codec][1]
+    # full-tensor pack (the TP=1 view)
+    kd_full, vd_full = _packed(codec, k, v)
+    # rank-split pack: two ranks, heads/2 each — exactly what each rank's
+    # store_kv sees under TP=2 (the backend hands rank-local head slices)
+    k_a, k_b = k[:, : heads // 2].contiguous(), k[:, heads // 2 :].contiguous()
+    v_a, v_b = v[:, : heads // 2].contiguous(), v[:, heads // 2 :].contiguous()
+    kd_a, vd_a = _packed(codec, k_a, v_a)
+    kd_b, vd_b = _packed(codec, k_b, v_b)
+    assert torch.equal(kd_a, kd_full[:, : heads // 2])
+    assert torch.equal(kd_b, kd_full[:, heads // 2 :])
+    assert torch.equal(vd_a, vd_full[:, : heads // 2])
+    assert torch.equal(vd_b, vd_full[:, heads // 2 :])
+
+
+def _packed(codec, k, v):
+    """Pack and return the packed byte tensors (no dequant)."""
+    L, heads = k.shape[0], k.shape[1]
+    bb = turbo_kv.CODEC_SPECS[codec][1]
+    locs = torch.arange(L, dtype=torch.int32, device="cuda")
+    kd = torch.empty(L, heads, bb, dtype=torch.uint8, device="cuda")
+    vd = torch.empty(L, heads, bb, dtype=torch.uint8, device="cuda")
+    turbo_kv.turbo_quantize(codec, k, kd, locs, is_v=False)
+    turbo_kv.turbo_quantize(codec, v, vd, locs, is_v=True)
+    return kd, vd

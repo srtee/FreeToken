@@ -123,6 +123,13 @@ class TurboKVCache(MHAKVCache):
                  "(channel %d scale %.3f)", count, max_ratio,
                  int(top.item()), float(scale[top].item()))
 
+    @property
+    def innerq_calibrated(self) -> bool:
+        """The calibration window ran to completion (scales uploaded, armed
+        window closed). Identity-outcome pools also read True — the window
+        ran, the codec just stayed exact (scales left at ones)."""
+        return not getattr(self, "_calib_armed", False)
+
     # ---- storage -----------------------------------------------------------------
 
     def _alloc_packed(self) -> None:
@@ -279,6 +286,10 @@ class TurboKVCache(MHAKVCache):
         for spec in config.model_config.kv_cache_group_specs():
             if spec.is_swa:
                 continue
+            if spec.head_dim != 128:
+                # The pool rejects non-128 head dims at construction; price
+                # at the f16 rate so an unsupported config never under-budgets.
+                return super().kv_cost(config)
             f16 = spec_kv_bytes_per_token(spec, config)
             per_token += f16 * bb // (2 * spec.head_dim // 128 * 128)
         
