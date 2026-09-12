@@ -204,38 +204,53 @@ class TurboKVCache(MHAKVCache):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Dequantize the pages referenced by ``page_table`` into the scratch
         fp16 buffers and return ``(k, v)`` views shaped for the FA/FI backends:
-        ``(bs, max_pages, heads, 128)`` fp16, page_table addressing intact."""
+        ``(bs, max_pages, heads, 128)`` fp16, page_table addressing intact.
+
+        The dequant kernel writes output rows COMPACTED (input row i ->
+        output row i), but the attention wrapper indexes the returned tensor
+        by ORIGINAL page id (page_table values). Those diverge the moment a
+        request's pages are not the pool's first ``n`` rows (prefix-cache
+        reuse hands out freed page ids >= n) — the wrapper would read
+        out-of-bounds scratch rows and attention sees garbage. So dequant
+        into a staging buffer, then SCATTER to the page-id positions of the
+        full-width scratch; the returned views are indexed by page id and
+        cover the whole slab."""
         from freetoken.kernel import turbo_kv
 
         dense = self._dense(layer_id)
         # page_table arrives either 2-D (fa: bs x table_len) or a flattened 1-D
         # ragged index list (fi: concatenation of each request's device rows).
         flat = page_table.reshape(-1)
-        n = flat.numel()
         heads = self._k_packed.shape[2]
-        k_scratch = self._scratch(n, heads)
-        v_scratch = self._scratch_v(n, heads)
+        full = self._num_pages * self._page_size
+        k_full = self._scratch(full, heads)
+        v_full = self._scratch_v(full, heads)
+        k_staging = torch.empty_like(k_full[: flat.numel()])
+        v_staging = torch.empty_like(v_full[: flat.numel()])
         turbo_kv.turbo_dequantize(
             self._codec,
             self._k_packed[dense],
-            k_scratch,
+            k_staging,
             flat,
             is_v=False,
         )
         turbo_kv.turbo_dequantize(
             self._codec,
             self._v_packed[dense],
-            v_scratch,
+            v_staging,
             flat,
             is_v=True,
         )
+        k_full[flat] = k_staging
+        v_full[flat] = v_staging
         if page_table.dim() == 2:
-            bs, table_len = page_table.shape
+            bs = page_table.shape[0]
+            # full page-id-addressable width; callers index by page id
             return (
-                k_scratch.view(bs, table_len, heads, 128),
-                v_scratch.view(bs, table_len, heads, 128),
+                k_full.view(bs, -1, heads, 128),
+                v_full.view(bs, -1, heads, 128),
             )
-        return k_scratch, v_scratch
+        return k_full, v_full
 
     def _scratch(self, n: int, heads: int) -> torch.Tensor:
         """Persistent dequant scratch for K. Allocated ONCE at the full page-

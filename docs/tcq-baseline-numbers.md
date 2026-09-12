@@ -34,7 +34,22 @@ with prefill scaling; treat the battery wall-clock numbers as unreliable
 VRAM deltas track the compression table (turbo3: 13300 vs f16 14940 MiB =
 1.6 GiB saved on 8192 tokens ~= the predicted 172 KiB/token x 8192).
 
-## 30-min turbo3_tcq soak — FAILED (drift/corruption found)
+## 30-min turbo3_tcq soak — RESOLVED (materializer page-id bug)
+
+**ROOT CAUSE FOUND AND FIXED** (commit after b72236f): `materialize()`
+dequantized rows COMPACTED into `scratch[:n]`, but the attention wrapper
+indexes the returned tensor by ORIGINAL page id. Request 1 worked by luck
+(fresh pool: page ids 0..12 < n=13); request 2+ wrote new tokens into
+reused pages (id >= n) and FlashInfer read out-of-bounds scratch rows —
+every request after the first was corrupted, on ALL turbo codecs, at ANY
+precision. The A/B that framed this as "turbo3 quality" was wrong: turbo8
+(0.64% relerr) showed the identical junk. Fix: dequant into staging,
+scatter to page-id positions of the full-width scratch (extra
+n x heads x 128 x 2B copy per layer per step). Verified: two-request repro
+now byte-stable; turbo8/turbo4/turbo3_tcq all coherent on the soak prompts
+(P1 609-720 chars vs f16 609; P2 367-432 vs f16 367); 490 tests green.
+
+Original failure record (kept for the investigation trail):
 
 17 turns x 3 prompts at temperature 0, 0 transport errors. Per-prompt drift
 check against an f16 A/B on the identical checkpoint + prompts:

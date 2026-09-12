@@ -405,3 +405,24 @@ Actions:
 Also noted: battery wall-clock for turbo8 8K (10.48s < f16 22.94s) is
 inconsistent — prefix-cache interaction suspected; re-run batteries with
 cache-busting before quoting pp/tg numbers.
+
+## SOAK FAILURE ROOT-CAUSED (2026-09-12 late): materializer page-id bug
+
+The "turbo3_tcq quality failure" was NOT a codec-quality issue. The
+materializer compacted dequantized rows into scratch[:n] while FlashInfer
+indexed by original page id — any request whose pages were not the pool's
+first n rows (everything after the first request, freed-page reuse) read
+out-of-bounds scratch. Affected ALL turbo codecs at any precision (turbo8
+at 0.64% relerr showed identical junk to turbo3 at 20%). Fix in
+turbo_pool.materialize: dequant into staging, scatter to page-id positions
+of the full-width scratch. Verified with the two-request repro + server
+A/B on turbo8/turbo4/turbo3_tcq (all coherent, matching f16 lengths) and
+490 tests green.
+
+Lessons:
+1. The per-codec relerr ladder (turbo8 0.64% / turbo4 9.6% / turbo3 20%
+   per-128-group on real K, CUDA == oracle) is real but was NOT the
+   failure — do not conflate precision headroom with correctness bugs.
+2. Single-request batteries structurally cannot catch reuse-path bugs;
+   multi-request A/B is mandatory for cache machinery.
+3. InnerQ real-K scales cut turbo3 relerr 0.20 -> 0.148 (26%) offline.
