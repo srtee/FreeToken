@@ -449,3 +449,31 @@ pool-geometry lift — no kernel/oracle edits:
   AND turbo3_tcq reproduce the llama.cpp ground-truth continuations
   (" Paris." / " 4, 5," / "\n    if n <=") and repeats are identical.
   Graphs stay disabled for turbo pools (capture-safety, unchanged).
+
+## Wave 2 + soak rerun (2026-09-13, commits 73f2bff..468d474)
+
+**Soak: PASS.** 31-min turbo3_tcq soak (20 turns x 3 prompts, 32B IQ3_XXS):
+per-prompt outputs deterministic, lengths identical across every turn
+(780/698/485 chars), zero drift/decay/loops — the prior soak's failure is
+confirmed as the materializer page-id bug, now gone. turbo3_tcq battery
+re-ran clean on the fixed path (2k 16.5s / 8k 24.6s, 13.3 GiB).
+
+**Wave 2 fused decode: SHIPPED** (468d474). Triton split-k decode reads the
+packed slabs directly — the dequant inverse FWHT folds into the query
+prologue (K) and stage-2 epilogue (V), so per-KV-row work is pure byte
+unpack + ieee dot. Key identities (verified vs oracle):
+  q · decode(c) = kInvSqrt128 · B(s1 ⊙ (si ⊙ q)) · (s2 ⊙ c)
+  Σ p_t decode(c_t) = kInvSqrt128 · s1 ⊙ si ⊙ B(Σ p_t s2 ⊙ c_t)
+Stage 1 stores rotated-domain partials; stage 2 combines (linear ⇒ fold
+commutes with softmax rescaling) then transforms once. Supports
+turbo8/turbo4/turbo3_tcq and head_dim 128/256. CUDA-graph capture is
+re-enabled for turbo pools on the triton backend (decode no longer runs
+the materializer); fi/fa remain eager. Parity: 6 tests, fused ==
+materializer within fp16 tolerance. Server smoke: 32B triton+turbo8
+captured bs 1/2/4, coherent, repeat-stable. Suite 500 green.
+
+Triton gotchas hit (for future kernels in this tree): tl tensor has no
+.ndim (use len(x.shape) — but inside jit prefer constexpr shape args);
+loop-carried `x: tl.constexpr` reassignment rejected (unroll); reshape
+dims must be plain constexpr ints (no tl tensors, no sentinels); tl.split
+splits the LAST axis (trans before/after to reach the pair axis).
