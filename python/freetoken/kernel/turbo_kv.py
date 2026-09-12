@@ -63,6 +63,10 @@ def _jit_turbo_module(codec_id: int, block_bytes: int) -> Module:
         cuda_wrappers=[
             ("launch", f"TurboQuantLaunch<{args}>::run"),
             ("upload", "TurboCodebookUpload::run"),
+            ("innerq_init", "TurboInnerQInit::run"),
+            ("innerq_reset", "TurboInnerQReset::run"),
+            ("innerq_upload", "TurboInnerQUpload::run"),
+            ("innerq_download", "TurboInnerQDownload::run"),
         ],
     )
 
@@ -75,18 +79,26 @@ def _jit_dequant_module() -> Module:
         cuda_wrappers=[
             ("dequant", "TurboDequantLaunch::run"),
             ("upload", "TurboCodebookUpload::run"),
+            ("innerq_init", "TurboInnerQInit::run"),
+            ("innerq_reset", "TurboInnerQReset::run"),
+            ("innerq_upload", "TurboInnerQUpload::run"),
+            ("innerq_download", "TurboInnerQDownload::run"),
         ],
     )
 
 
 def _upload_into(module: Module) -> None:
     """Upload the TCQ codebooks into THIS module's __device__ arrays (each
-    JIT module carries its own copy of the symbols)."""
+    JIT module carries its own copy of the symbols) and initialize the
+    InnerQ scales to identity (device arrays are zero-initialized, which
+    would zero the KV groups until real scales are uploaded)."""
     cb3k = _load_codebook(CODEBOOK_DIR / "tcq3bit_k.bin", 512)
     cb3v = _load_codebook(CODEBOOK_DIR / "tcq3bit_v.bin", 512)
     cb2k = _load_codebook(CODEBOOK_DIR / "tcq2bit_k.bin", 256)
     cb2v = _load_codebook(CODEBOOK_DIR / "tcq2bit_v.bin", 256)
     module.upload(cb3k, cb3v, cb2k, cb2v)
+    if hasattr(module, "innerq_init"):
+        module.innerq_init(torch.zeros(1, dtype=torch.float32, device="cuda"))
 
 
 @functools.cache
@@ -139,3 +151,66 @@ def turbo_dequantize(
     ``dst`` (L, heads, 128) fp16."""
     module = _upload_dequant_module()
     module.dequant(src, dst, locs, CODEC_SPECS[codec][0], int(is_v))
+
+
+# ---- InnerQ calibration surface ---------------------------------------------
+#
+# One device-global [128] accumulator set shared by K and V quantize kernels
+# (buun semantics). The pool drives the state machine: arm -> quantize calls
+# accumulate raw stats -> download -> compute scales on CPU -> upload.
+
+
+def innerq_arm_calibration(codec: str) -> None:
+    """Reset the accumulators and arm calibration on the quant module for
+    ``codec`` (subsequent turbo_quantize calls accumulate raw-domain stats)."""
+    codec_id, bb = CODEC_SPECS[codec]
+    tag = torch.zeros(1, dtype=torch.float32, device="cuda")
+    _upload_quant_module(codec_id, bb).innerq_reset(tag)
+
+
+def innerq_disarm_calibration(codec: str) -> None:
+    """Stop accumulating: upload identity scales (exact codec behavior)."""
+    codec_id, bb = CODEC_SPECS[codec]
+    ones = torch.ones(128, dtype=torch.float32, device="cuda")
+    _upload_quant_module(codec_id, bb).innerq_upload(ones, ones)
+
+
+def innerq_download_stats(codec: str) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Copy the calibration accumulators to CPU: (channel_sq[128],
+    channel_max[128], count)."""
+    codec_id, bb = CODEC_SPECS[codec]
+    tag = torch.zeros(1, dtype=torch.float32, device="cuda")
+    sq = torch.zeros(128, dtype=torch.float32, device="cuda")
+    ch_max = torch.zeros(128, dtype=torch.float32, device="cuda")
+    count = torch.zeros(1, dtype=torch.int32, device="cuda")
+    _upload_quant_module(codec_id, bb).innerq_download(sq, ch_max, count, tag)
+    return sq.cpu(), ch_max.cpu(), int(count[0].item())
+
+
+def innerq_upload_scales(codec: str, scale: torch.Tensor,
+                         scale_inv: torch.Tensor) -> None:
+    """Upload per-channel scales (128 f32 each) and disarm calibration.
+    Identity tensors keep the codec bit-exact."""
+    codec_id, bb = CODEC_SPECS[codec]
+    _upload_quant_module(codec_id, bb).innerq_upload(scale.cuda(), scale_inv.cuda())
+
+
+def innerq_finalize_scales(sq: torch.Tensor, ch_max: torch.Tensor, count: int,
+                           *, strength: float = 0.5, max_clamp: float = 2.0,
+                           auto_disable_ratio: float = 1.2) -> tuple[torch.Tensor, float] | None:
+    """Compute per-channel scales from accumulated stats (buun's RMS mode):
+    s = (mean_rms / channel_rms)^strength, clamped to [1/max_clamp,
+    max_clamp]. Returns None when channels are already balanced (max ratio
+    below ``auto_disable_ratio``)."""
+    if count == 0:
+        return None
+    channel_rms = (sq / count).sqrt()
+    mean_rms = channel_rms.mean()
+    scale = torch.ones(128, dtype=torch.float32)
+    live = channel_rms > 1e-10
+    scale[live] = (mean_rms / channel_rms[live]) ** strength
+    scale = scale.clamp(1.0 / max_clamp, max_clamp)
+    max_ratio = float(torch.maximum(scale, 1.0 / scale).max())
+    if max_ratio < auto_disable_ratio:
+        return None
+    return scale, max_ratio

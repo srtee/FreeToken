@@ -89,11 +89,18 @@ class EngineConfig:
     # 2.25 bpv). Non-f16 requires head_dim=128, page_size=1, and the
     # materializer path in the attention backend.
     kv_codec: str = "f16"
+    # InnerQ per-channel equalization (TCQ plan 3.1): "none" (default) or
+    # "innerq". With innerq, the turbo pool calibrates per-channel K/V
+    # scales over the first ~2048 stored tokens, then equalizes channels
+    # before quantization and unscales at the materializer.
+    kv_codec_tune: str = "none"
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
 
     def __post_init__(self):
+        if self.kv_codec_tune != "none" and self.kv_codec == "f16":
+            raise ValueError("--kv-codec-tune innerq requires a non-f16 --kv-codec")
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":

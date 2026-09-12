@@ -33,6 +33,12 @@ from .mha_pool import MHAKVCache
 class TurboKVCache(MHAKVCache):
     """MHAKVCache with packed quantized storage and a materializer."""
 
+    # InnerQ calibration window (kv_codec_tune == "innerq"): the first
+    # CALIBRATION_TOKENS stored tokens accumulate raw-domain per-channel
+    # stats; then the pool computes buun-formula scales and uploads them.
+    # One global [128] accumulator set shared by K and V (buun semantics).
+    CALIBRATION_TOKENS = 2048
+
     def __init__(
         self,
         num_kv_heads: int,
@@ -75,6 +81,47 @@ class TurboKVCache(MHAKVCache):
             layer_ids=layer_ids,
         )
         self._alloc_packed()
+
+    # ---- InnerQ calibration --------------------------------------------------------
+
+    def arm_innerq_calibration(self) -> None:
+        """Arm the calibration window: subsequent quantize calls accumulate
+        raw-domain per-channel stats until CALIBRATION_TOKENS are stored."""
+        from freetoken.kernel import turbo_kv
+        from freetoken.utils import init_logger
+        self._calib_tokens = 0
+        self._calib_armed = True
+        turbo_kv.innerq_arm_calibration(self._codec)
+        init_logger(__name__).info(
+            "InnerQ calibration armed (%s): accumulating raw K/V stats over "
+            "the first %d stored tokens", self._codec, self.CALIBRATION_TOKENS)
+
+    def _note_calibration_tokens(self, n_tokens: int) -> None:
+        if not getattr(self, "_calib_armed", False):
+            return
+        from freetoken.kernel import turbo_kv
+        from freetoken.utils import init_logger
+        self._calib_tokens += n_tokens
+        if self._calib_tokens < self.CALIBRATION_TOKENS:
+            return
+        self._calib_armed = False
+        sq, ch_max, count = turbo_kv.innerq_download_stats(self._codec)
+        res = turbo_kv.innerq_finalize_scales(sq, ch_max, count)
+        log = init_logger(__name__)
+        if res is None:
+            # Identity upload disarms and keeps the codec exact: channels
+            # already balanced (max ratio < 1.2) or the window saw no data.
+            turbo_kv.innerq_upload_scales(
+                self._codec, torch.ones(128), torch.ones(128))
+            log.info("InnerQ: channels already balanced after %d groups — "
+                     "scales left at identity", count)
+            return
+        scale, max_ratio = res
+        turbo_kv.innerq_upload_scales(self._codec, scale, 1.0 / scale)
+        top = (scale - 1.0).abs().argmax()
+        log.info("InnerQ calibration done: %d groups, max scale ratio %.3f "
+                 "(channel %d scale %.3f)", count, max_ratio,
+                 int(top.item()), float(scale[top].item()))
 
     # ---- storage -----------------------------------------------------------------
 
@@ -128,6 +175,7 @@ class TurboKVCache(MHAKVCache):
         dense = self._dense(layer_id)
         heads = self._k_packed.shape[2]
         n_tokens = k.numel() // (heads * 128)
+        self._note_calibration_tokens(n_tokens)
         # k/v arrive as strided slices of the fused qkv projection — quantize
         # needs contiguous rows.
         k3 = k.reshape(n_tokens, heads, 128).contiguous()

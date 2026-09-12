@@ -125,6 +125,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
         kv_codec=getattr(config, "kv_codec", "f16"),
+        kv_codec_tune=getattr(config, "kv_codec_tune", "none"),
     )
 
 
@@ -137,6 +138,7 @@ def create_kvcache_pool(
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
     kv_codec: str = "f16",
+    kv_codec_tune: str = "none",
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -258,7 +260,7 @@ def create_kvcache_pool(
     if kv_codec != "f16":
         from .turbo_pool import TurboKVCache
 
-        return TurboKVCache(
+        pool = TurboKVCache(
             num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
             num_pages=num_pages,
             page_size=page_size,
@@ -269,6 +271,9 @@ def create_kvcache_pool(
             codec=kv_codec,
             layer_ids=layer_ids,
         )
+        if kv_codec_tune == "innerq":
+            pool.arm_innerq_calibration()
+        return pool
     return MHAKVCache(
         num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
         num_pages=num_pages,

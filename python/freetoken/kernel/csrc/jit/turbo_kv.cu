@@ -131,6 +131,96 @@ template <> __device__ __forceinline__ float turbo_load_as_float<__nv_bfloat16>(
   return __bfloat162float(*p);
 }
 
+// ---- InnerQ per-channel equalization (plan item 3.1; buun's d_innerq_*) -----
+//
+// One global [128] scale shared by K and V (buun semantics: calibration pools
+// both). scale applies to the raw group BEFORE L2-norm/FWHT at encode; the
+// dequant tail multiplies by scale_inv to restore the original domain.
+// calibration=1 accumulates raw-domain stats into channel_sq/channel_max
+// (one count per 128-group, K and V pooled); the pool finalizes after its
+// token budget and uploads the computed scales.
+__device__ float d_innerq_channel_scale[128];
+__device__ float d_innerq_channel_scale_inv[128];
+__device__ float d_innerq_channel_sq[128];
+__device__ float d_innerq_channel_max[128];
+__device__ int d_innerq_count;
+__device__ int d_innerq_calibrate;
+
+__device__ __forceinline__ void turbo_innerq_calibrate(float xj, int tid) {
+  atomicAdd(&d_innerq_channel_sq[tid], xj * xj);
+  // atomicMax for float via CAS loop (no native float atomicMax)
+  unsigned int *addr = (unsigned int *)&d_innerq_channel_max[tid];
+  unsigned int old_val = __float_as_uint(fabsf(xj));
+  unsigned int assumed;
+  do {
+    assumed = *addr;
+    if (__uint_as_float(assumed) >= fabsf(xj)) break;
+  } while (atomicCAS(addr, assumed, old_val) != assumed);
+  if (tid == 0) atomicAdd(&d_innerq_count, 1);
+}
+
+extern "C" void turbo_innerq_init_scales(void* stream) {
+  // Identity scales: __device__ arrays are zero-initialized, which would
+  // zero the KV groups until real scales are uploaded. Called from the
+  // python module-upload path (once per JIT module, like codebooks).
+  float ones[128];
+  for (int i = 0; i < 128; i++) ones[i] = 1.0f;
+  const int zero = 0;
+  cudaMemcpyToSymbolAsync(d_innerq_channel_scale, ones, sizeof(ones), 0,
+                          cudaMemcpyHostToDevice, (cudaStream_t)stream);
+  cudaMemcpyToSymbolAsync(d_innerq_channel_scale_inv, ones, sizeof(ones), 0,
+                          cudaMemcpyHostToDevice, (cudaStream_t)stream);
+  cudaMemcpyToSymbolAsync(d_innerq_calibrate, &zero, sizeof(zero), 0,
+                          cudaMemcpyHostToDevice, (cudaStream_t)stream);
+}
+
+extern "C" void turbo_innerq_reset_calibration(void* stream) {
+  const float zeros[128] = {};
+  const int zero = 0, one = 1;
+  cudaMemcpyToSymbolAsync(d_innerq_channel_sq, zeros, sizeof(zeros), 0,
+                          cudaMemcpyHostToDevice, (cudaStream_t)stream);
+  cudaMemcpyToSymbolAsync(d_innerq_channel_max, zeros, sizeof(zeros), 0,
+                          cudaMemcpyHostToDevice, (cudaStream_t)stream);
+  cudaMemcpyToSymbolAsync(d_innerq_count, &zero, sizeof(zero), 0,
+                          cudaMemcpyHostToDevice, (cudaStream_t)stream);
+  cudaMemcpyToSymbolAsync(d_innerq_calibrate, &one, sizeof(one), 0,
+                          cudaMemcpyHostToDevice, (cudaStream_t)stream);
+}
+
+extern "C" void turbo_innerq_upload_scales(const float* scale, const float* scale_inv,
+                                           void* stream) {
+  const int zero = 0;  // disarms calibration
+  if (scale != nullptr && scale_inv != nullptr) {
+    cudaMemcpyToSymbolAsync(d_innerq_channel_scale, scale, 128 * sizeof(float), 0,
+                            cudaMemcpyHostToDevice, (cudaStream_t)stream);
+    cudaMemcpyToSymbolAsync(d_innerq_channel_scale_inv, scale_inv, 128 * sizeof(float), 0,
+                            cudaMemcpyHostToDevice, (cudaStream_t)stream);
+  }
+  cudaMemcpyToSymbolAsync(d_innerq_calibrate, &zero, sizeof(zero), 0,
+                          cudaMemcpyHostToDevice, (cudaStream_t)stream);
+}
+
+extern "C" void turbo_innerq_download_stats(float* sq, float* ch_max, int* count,
+                                            void* stream) {
+  cudaMemcpyFromSymbolAsync(sq, d_innerq_channel_sq, 128 * sizeof(float), 0,
+                            cudaMemcpyDeviceToHost, (cudaStream_t)stream);
+  cudaMemcpyFromSymbolAsync(ch_max, d_innerq_channel_max, 128 * sizeof(float), 0,
+                            cudaMemcpyDeviceToHost, (cudaStream_t)stream);
+  cudaMemcpyFromSymbolAsync(count, d_innerq_count, sizeof(int), 0,
+                            cudaMemcpyDeviceToHost, (cudaStream_t)stream);
+  cudaStreamSynchronize((cudaStream_t)stream);
+}
+
+__device__ __forceinline__ float turbo_innerq_scale(int tid) {
+  return d_innerq_channel_scale[tid];
+}
+__device__ __forceinline__ float turbo_innerq_scale_inv(int tid) {
+  return d_innerq_channel_scale_inv[tid];
+}
+__device__ __forceinline__ int turbo_innerq_armed() {
+  return d_innerq_calibrate;
+}
+
 struct TurboQuantParams {
   const void *__restrict__ src;   // (L, heads, 128)
   void *__restrict__ dst;         // (tokens, heads, block_bytes)
@@ -165,6 +255,11 @@ __global__ void turbo_quant_kernel(const __grid_constant__ TurboQuantParams p) {
   x[tid] = turbo_load_as_float(&src[(int64_t)row * p.heads * 128 + head * 128 + tid]);
   __syncthreads();
 
+  // InnerQ: accumulate raw-domain stats during calibration, then equalize
+  // channels before the L2 norm (buun applies scale pre-norm, K and V both).
+  if (turbo_innerq_armed()) turbo_innerq_calibrate(x[tid], tid);
+  x[tid] *= turbo_innerq_scale(tid);
+  __syncthreads();
   // L2 norm reduction
   __shared__ float red[128];
   red[tid] = x[tid] * x[tid];
@@ -292,6 +387,14 @@ turbo_tcq_quant_kernel(const __grid_constant__ TurboQuantParams p) {
 
   if (sid < 128) {
     x[sid] = turbo_load_as_float(&src[(int64_t)row * p.heads * 128 + head * 128 + sid]);
+  }
+  __syncthreads();
+
+  // InnerQ: raw-domain calibration + equalization before the L2 norm
+  // (same shape as turbo_quant_kernel; buun applies scale pre-norm).
+  if (sid < 128) {
+    if (turbo_innerq_armed()) turbo_innerq_calibrate(x[sid], sid);
+    x[sid] *= turbo_innerq_scale(sid);
   }
   __syncthreads();
 
@@ -599,6 +702,11 @@ __global__ void turbo_dequant_kernel(const __grid_constant__ TurboDequantParams 
   v = (tid & 64) ? (smem[tid - 64] - v) : (v + smem[tid + 64]);
   __syncthreads();
   v = v * kInvSqrt128 * d_turbo_wht_s1[tid];
+  // InnerQ: the norm slot carries the scaled-domain group norm, so the
+  // reconstruction is in the scaled domain — undo the channel scale to
+  // serve original-domain K/V to the stock FA/FI kernels (buun applies
+  // scale_inv in its fused FA; here the materializer is the only path).
+  v *= turbo_innerq_scale_inv(tid);
 
   if (dst_is_bf16) {
     *out_b = __float2bfloat16(v);
@@ -771,5 +879,70 @@ struct TurboCodebookUpload {
     turbo_upload_codebooks((const float *)cb3k.data_ptr(), (const float *)cb3v.data_ptr(),
                            (const float *)cb2k.data_ptr(), (const float *)cb2v.data_ptr(),
                            stream);
+  }
+};
+
+// ---- InnerQ host entry points (pool calibration state machine) --------------
+struct TurboInnerQInit {
+  // device_tag: any [1] f32 CUDA tensor, used only for stream/device context.
+  static void run(const tvm::ffi::TensorView device_tag) {
+    using namespace host;
+    auto device_ = SymbolicDevice{};
+    TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(device_tag);
+    const auto device = device_.unwrap();
+    cudaStream_t stream =
+        static_cast<cudaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
+    turbo_innerq_init_scales(stream);
+  }
+};
+
+struct TurboInnerQReset {
+  // device_tag: any [1] f32 CUDA tensor, used only for stream/device context.
+  static void run(const tvm::ffi::TensorView device_tag) {
+    using namespace host;
+    auto device_ = SymbolicDevice{};
+    TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(device_tag);
+    const auto device = device_.unwrap();
+    cudaStream_t stream =
+        static_cast<cudaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
+    turbo_innerq_reset_calibration(stream);
+  }
+};
+
+struct TurboInnerQUpload {
+  // scale/scale_inv are [128] f32; identity tensors disarm calibration
+  // while leaving the codec exact.
+  static void run(const tvm::ffi::TensorView scale,
+                  const tvm::ffi::TensorView scale_inv) {
+    using namespace host;
+    auto device_ = SymbolicDevice{};
+    auto N = SymbolicSize{"N"};
+    TensorMatcher({N}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(scale);
+    TensorMatcher({N}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(scale_inv);
+    RuntimeCheck(N.unwrap() == 128, "innerq upload: scale must be [128]");
+    const auto device = device_.unwrap();
+    cudaStream_t stream =
+        static_cast<cudaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
+    turbo_innerq_upload_scales((const float *)scale.data_ptr(),
+                               (const float *)scale_inv.data_ptr(), stream);
+  }
+};
+
+struct TurboInnerQDownload {
+  static void run(const tvm::ffi::TensorView sq,
+                  const tvm::ffi::TensorView ch_max,
+                  const tvm::ffi::TensorView count,
+                  const tvm::ffi::TensorView device_tag) {
+    using namespace host;
+    auto device_ = SymbolicDevice{};
+    TensorMatcher({128}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(sq);
+    TensorMatcher({128}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(ch_max);
+    TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(count);
+    TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(device_tag);
+    const auto device = device_.unwrap();
+    cudaStream_t stream =
+        static_cast<cudaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
+    turbo_innerq_download_stats((float *)sq.data_ptr(), (float *)ch_max.data_ptr(),
+                                (int *)count.data_ptr(), stream);
   }
 };

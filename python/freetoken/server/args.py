@@ -424,6 +424,16 @@ def parse_args(
         "8.125/4.125/3.25/2.25 bits per value). Non-f16 requires head_dim=128 "
         "and page_size=1; reads go through a dequantizing materializer.",
     )
+    parser.add_argument(
+        "--kv-codec-tune",
+        type=str,
+        default=ServerArgs.kv_codec_tune,
+        choices=["none", "innerq"],
+        help="Per-channel KV equalization (TCQ plan 3.1). innerq = calibrate "
+        "per-channel K/V scales over the first ~2048 stored tokens, then "
+        "equalize channels before quantization and unscale at the "
+        "materializer. Requires a non-f16 --kv-codec.",
+    )
 
     parser.add_argument(
         "--cache-type",
