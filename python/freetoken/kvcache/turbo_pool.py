@@ -172,10 +172,25 @@ class TurboKVCache(MHAKVCache):
                  local_kv_heads * self._groups, self._bb)
         self._k_packed = torch.zeros(shape, dtype=torch.uint8, device=self._device)
         self._v_packed = torch.zeros(shape, dtype=torch.uint8, device=self._device)
+        # Full-width materializer scratch is sized from _num_pages on first
+        # use; a rebuild that changed the page count invalidates it (the
+        # scatter target must cover every live page id).
+        for attr in ("_k_scratch", "_v_scratch"):
+            if hasattr(self, attr):
+                delattr(self, attr)
         # Keep the base class's bookkeeping consistent (it rebuilds _kv_buffer;
         # ours is a stub — patch the fields it derives from _storage_shape).
         self._storage_shape = (num_pages * self._page_size, local_kv_heads,
                                self._head_dim)
+
+    def rebuild_from_config(
+        self, config, num_pages: int, *, num_swa_pages: int | None = None
+    ) -> None:
+        """Runtime-resize hook (ft ctl cache --kv N). Packed slabs are
+        codec-uniform, so the rebuild is a plain realloc — the same
+        no-content-preservation contract as the f16 pool (idle-only,
+        prefix cache reset by the scheduler)."""
+        self.rebuild(num_pages)
 
     # ---- write path ----------------------------------------------------------------
 

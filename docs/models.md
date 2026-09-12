@@ -48,10 +48,18 @@ group magnitude.
 | turbo3_tcq | 3.25 | 4.9x | 27B+; TCQ bitstream is byte-exact vs the torch oracle |
 | turbo2_tcq | 2.25 | 7.1x | 27B+; experimental |
 
-Constraints: head_dim == 128, page_size 1, CUDA decode (the
-materializer is CUDA-only). Hybrid GDN models (qwen3.5/3.6) are supported —
-only the full-attention layers carry KV (head_dim 128 on supported hybrids),
-so the compression applies to that subset; linear layers cost no KV at all.
+Constraints: head_dim % 128 == 0 (one rotation group per 128 values —
+wider heads such as Qwen3.6-35B's 256-dim full-attention heads carry
+independent groups), page_size 1, CUDA. Hybrid GDN models (qwen3.5/3.6)
+are supported — only the full-attention layers carry KV, so the
+compression applies to that subset; linear layers cost no KV at all.
+
+Decode reads the packed slabs directly (Triton fused-decode kernels: the
+dequant inverse rotation is folded into the query and the output
+accumulator, so per-token decode work is byte-unpack + dot). Prefill goes
+through a dequantizing materializer. Use `--attention-backend triton` with
+turbo codecs: it is the only backend with the fused decode and CUDA-graph
+capture; fi/fa materialize in the decode path and force graphs off.
 
 With `--kv-codec-tune innerq`, per-channel K/V scales are calibrated over the
 first ~2048 stored tokens and channels are equalized before quantization —
