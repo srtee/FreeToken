@@ -426,3 +426,26 @@ Lessons:
 2. Single-request batteries structurally cannot catch reuse-path bugs;
    multi-request A/B is mandatory for cache machinery.
 3. InnerQ real-K scales cut turbo3 relerr 0.20 -> 0.148 (26%) offline.
+
+## Wave 4: head-dim-256 support (2026-09-13)
+
+Shipped. The kernels were already 128-group native, so the change is a
+pool-geometry lift — no kernel/oracle edits:
+- turbo_pool: head_dim % 128 == 0 accepted (was == 128); slab row axis =
+  kv_heads * (head_dim//128) groups; store_kv reshapes
+  (n, kv_heads, head_dim) -> (n, kv_heads*G, 128); materialize reassembles
+  (rows, kv_heads, head_dim) for the backends (identity view at G=1).
+- fi.py turbo view: head-dim de-hardcoded (uses the tensor's own dims).
+- kv_cost: packed pricing now head_dim-independent — per token per spec,
+  f16_bytes * bb // 256 (the packed/f16 ratio bb/(2*128) doesn't change
+  with head_dim since packed scales with the group count). NOTE: an
+  intermediate edit transiently dropped the per_token += line and zeroed
+  cache_per_page (MoE budget planner assert); fixed and covered by the
+  cost test.
+- Tests: tests/kernels/test_turbo_head_dim256.py (kernel group-decomp
+  byte-equality, pool store/materialize geometry at 2 kv heads x 256,
+  kv_cost 256 == 2x 128, non-multiple rejection). Full suite 494 green.
+- 35B smoke (Qwen3.6-35B-A3B NVFP4 GGUF, moe offload, 8280 pages): turbo8
+  AND turbo3_tcq reproduce the llama.cpp ground-truth continuations
+  (" Paris." / " 4, 5," / "\n    if n <=") and repeats are identical.
+  Graphs stay disabled for turbo pools (capture-safety, unchanged).

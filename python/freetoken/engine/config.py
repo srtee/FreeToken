@@ -86,8 +86,9 @@ class EngineConfig:
     num_page_override: int | None = None  # if not None, will override the number of pages
     # KV storage codec: f16 (default) or a TurboQuant/TCQ packed codec
     # (turbo8 8.125 bpv, turbo4 4.125 bpv, turbo3_tcq 3.25 bpv, turbo2_tcq
-    # 2.25 bpv). Non-f16 requires head_dim=128, page_size=1, and the
-    # materializer path in the attention backend.
+    # 2.25 bpv). Non-f16 requires head_dim % 128 == 0 (one rotation group
+    # per 128 values; wider heads carry independent groups), page_size=1,
+    # and the materializer path in the attention backend.
     kv_codec: str = "f16"
     # InnerQ per-channel equalization (TCQ plan 3.1): "none" (default) or
     # "innerq". With innerq, the turbo pool calibrates per-channel K/V

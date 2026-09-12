@@ -53,9 +53,10 @@ class TurboKVCache(MHAKVCache):
     ) -> None:
         if codec not in CODEC_SPECS:
             raise ValueError(f"unknown kv codec {codec!r}")
-        if head_dim != 128:
+        if head_dim % 128 != 0:
             raise ValueError(
-                f"turbo KV codecs require head_dim == 128 (rotation group), got {head_dim}"
+                f"turbo KV codecs require head_dim to be a multiple of the "
+                f"128-element rotation group, got {head_dim}"
             )
         if page_size != 1:
             raise ValueError("turbo KV pools require page_size=1")
@@ -66,6 +67,8 @@ class TurboKVCache(MHAKVCache):
         self._input_dtype = dtype
         self._num_pages = num_pages
         self._page_size = page_size
+        self._head_dim = head_dim
+        self._groups = head_dim // 128
         # The base class allocates fp16 slabs we never use — at 4097 pages x
         # 48 layers that's ~1 GiB wasted transiently. Allocate a 1-page stub to
         # satisfy the base's bookkeeping, then swap in the real packed slabs
@@ -133,7 +136,11 @@ class TurboKVCache(MHAKVCache):
     # ---- storage -----------------------------------------------------------------
 
     def _alloc_packed(self) -> None:
-        """Replace the inherited fp16 buffers with uint8 packed slabs."""
+        """Replace the inherited fp16 buffers with uint8 packed slabs.
+
+        One slab row holds one 128-element rotation group: rows per token =
+        kv_heads * (head_dim // 128). The kernels are 128-group native; wider
+        heads simply carry more independent groups."""
         _, num_storage_layers, _, _, local_kv_heads, _ = self._kv_buffer.shape
         self._kv_buffer = None
         self._k_buffer = None
@@ -141,7 +148,7 @@ class TurboKVCache(MHAKVCache):
         shape = (
             num_storage_layers,
             self._num_pages * self._page_size,
-            local_kv_heads,
+            local_kv_heads * self._groups,
             self._bb,
         )
         self._k_packed = torch.zeros(shape, dtype=torch.uint8, device=self._device)
@@ -161,12 +168,14 @@ class TurboKVCache(MHAKVCache):
         if self._device.type == "cuda":
             torch.cuda.synchronize(self._device)
             torch.cuda.empty_cache()
-        shape = (num_storage_layers, num_pages * self._page_size, local_kv_heads, self._bb)
+        shape = (num_storage_layers, num_pages * self._page_size,
+                 local_kv_heads * self._groups, self._bb)
         self._k_packed = torch.zeros(shape, dtype=torch.uint8, device=self._device)
         self._v_packed = torch.zeros(shape, dtype=torch.uint8, device=self._device)
         # Keep the base class's bookkeeping consistent (it rebuilds _kv_buffer;
         # ours is a stub — patch the fields it derives from _storage_shape).
-        self._storage_shape = (num_pages * self._page_size, local_kv_heads, 128)
+        self._storage_shape = (num_pages * self._page_size, local_kv_heads,
+                               self._head_dim)
 
     # ---- write path ----------------------------------------------------------------
 
@@ -180,11 +189,13 @@ class TurboKVCache(MHAKVCache):
         from freetoken.kernel import turbo_kv
 
         dense = self._dense(layer_id)
-        heads = self._k_packed.shape[2]
+        heads = self._k_packed.shape[2]  # kv_heads * rotation groups
         n_tokens = k.numel() // (heads * 128)
         self._note_calibration_tokens(n_tokens)
         # k/v arrive as strided slices of the fused qkv projection — quantize
-        # needs contiguous rows.
+        # needs contiguous rows. (n, kv_heads, head_dim) -> (n, heads, 128) is
+        # a free row-major rechunk: heads already carries the group count, so
+        # n_tokens divides by heads*128 for ANY head_dim.
         k3 = k.reshape(n_tokens, heads, 128).contiguous()
         v3 = v.reshape(n_tokens, heads, 128).contiguous()
         turbo_kv.turbo_quantize(
@@ -204,7 +215,7 @@ class TurboKVCache(MHAKVCache):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Dequantize the pages referenced by ``page_table`` into the scratch
         fp16 buffers and return ``(k, v)`` views shaped for the FA/FI backends:
-        ``(bs, max_pages, heads, 128)`` fp16, page_table addressing intact.
+        ``(bs, max_pages, kv_heads, head_dim)`` fp16, page_table addressing intact.
 
         The dequant kernel writes output rows COMPACTED (input row i ->
         output row i), but the attention wrapper indexes the returned tensor
@@ -221,7 +232,8 @@ class TurboKVCache(MHAKVCache):
         # page_table arrives either 2-D (fa: bs x table_len) or a flattened 1-D
         # ragged index list (fi: concatenation of each request's device rows).
         flat = page_table.reshape(-1)
-        heads = self._k_packed.shape[2]
+        heads = self._k_packed.shape[2]  # kv_heads * rotation groups
+        kv_heads = heads // self._groups
         full = self._num_pages * self._page_size
         k_full = self._scratch(full, heads)
         v_full = self._scratch_v(full, heads)
@@ -243,14 +255,19 @@ class TurboKVCache(MHAKVCache):
         )
         k_full[flat] = k_staging
         v_full[flat] = v_staging
+        # Reassemble model-native geometry: (rows, kv_heads*groups, 128) ->
+        # (rows, kv_heads, head_dim) so FlashInfer/FA index heads, not groups.
+        # For head_dim=128 this view is the identity.
+        k_m = k_full.view(full, kv_heads, self._head_dim)
+        v_m = v_full.view(full, kv_heads, self._head_dim)
         if page_table.dim() == 2:
             bs = page_table.shape[0]
             # full page-id-addressable width; callers index by page id
             return (
-                k_full.view(bs, -1, heads, 128),
-                v_full.view(bs, -1, heads, 128),
+                k_m.view(bs, -1, kv_heads, self._head_dim),
+                v_m.view(bs, -1, kv_heads, self._head_dim),
             )
-        return k_full, v_full
+        return k_m, v_m
 
     def _scratch(self, n: int, heads: int) -> torch.Tensor:
         """Persistent dequant scratch for K. Allocated ONCE at the full page-
@@ -293,21 +310,22 @@ class TurboKVCache(MHAKVCache):
         # times 2 (K and V). The dummy-page headroom follows the f16 convention.
         from .base import spec_kv_bytes_per_token
 
-        # f16 bytes/token per group -> packed: divide by 2*head_dim/128 (f16
-        # stores 2 B/elem x head_dim; packed stores bb B per 128-elem group per
-        # slab) — i.e. multiply by bb / (2 * head_dim / 128). Keep the layer
-        # and head-division terms from the f16 formula.
+        # packed per token per head = (head_dim/128) * bb vs f16's
+        # head_dim * 2 B — the ratio bb/(2*128) is head_dim-independent
+        # (packed scales with head_dim exactly as f16 does, via the group
+        # count), so multiply the f16 formula by bb//256 for any
+        # supported head_dim. Keep the layer/head terms from f16.
         per_token = 0
         for spec in config.model_config.kv_cache_group_specs():
             if spec.is_swa:
                 continue
-            if spec.head_dim != 128:
-                # The pool rejects non-128 head dims at construction; price
-                # at the f16 rate so an unsupported config never under-budgets.
+            if spec.head_dim % 128 != 0:
+                # The pool rejects non-multiple-of-128 head dims at
+                # construction; price at the f16 rate so an unsupported
+                # config never under-budgets.
                 return super().kv_cost(config)
             f16 = spec_kv_bytes_per_token(spec, config)
-            per_token += f16 * bb // (2 * spec.head_dim // 128 * 128)
-        
+            per_token += f16 * bb // (2 * 128)
         return per_token * config.page_size, 0, config.page_size, 0
 
     @property

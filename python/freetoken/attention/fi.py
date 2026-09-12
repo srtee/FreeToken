@@ -221,12 +221,13 @@ class FlashInferBackend(BaseAttnBackend):
         pool = self.kvcache
         if getattr(pool, "is_turbo", False):
             k_m, v_m = pool.materialize(layer_id, metadata.indices, metadata.seq_lens_cpu)
-            # scratch is (n_rows, heads, 128) in the pool's input dtype: view
-            # as flashinfer's page=1 layout. No cast needed — the dequant kernel
-            # emits the model dtype directly, matching the plan's kv_data_type.
+            # materialize returns (n_rows, kv_heads, head_dim) in the pool's
+            # input dtype: view as flashinfer's page=1 layout. No cast needed —
+            # the dequant kernel emits the model dtype directly, matching the
+            # plan's kv_data_type.
             kv_cache = (
-                k_m.view(-1, 1, k_m.shape[1], 128),
-                v_m.view(-1, 1, v_m.shape[1], 128),
+                k_m.view(-1, 1, k_m.shape[1], k_m.shape[2]),
+                v_m.view(-1, 1, v_m.shape[1], v_m.shape[2]),
             )
         else:
             kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
