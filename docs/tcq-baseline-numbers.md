@@ -22,16 +22,38 @@ temperature 0; VRAM sampled post-load. Run through the Slurm chain in
 
 | Codec | VRAM MiB (weights+KV 8192 tok) | 2K prefill+128 dec (s) | 8K prefill+128 dec (s) |
 |---|---|---|---|
-| f16 | 14940 | 11.78 | 22.93 |
-| turbo8 | pending | pending | pending |
-| turbo4 | pending | pending | pending |
-| turbo3_tcq | pending | pending | pending |
+| f16 | 14940 | 11.78 | 22.94 |
+| turbo8 | 13920 | 23.15 | 10.48 |
+| turbo4 | 13420 | 23.18 | 24.02 |
+| turbo3_tcq | 13300 | 23.52 | 24.30 |
 
-## 30-min turbo3_tcq soak
+Battery anomaly: turbo8's 8K wall (10.48s) is FASTER than f16 (22.94s) and
+faster than its own 2K (23.15s) — inconsistent with the other codecs and
+with prefill scaling; treat the battery wall-clock numbers as unreliable
+(prefix-cache interaction suspected) until re-run with cache-busting.
+VRAM deltas track the compression table (turbo3: 13300 vs f16 14940 MiB =
+1.6 GiB saved on 8192 tokens ~= the predicted 172 KiB/token x 8192).
 
-Pending — `soak/soak30.sh` under Slurm (`soak30-turbo3` job). Drift signal:
-repeated output hashes across turns on identical prompts, monotonic length
-decay, or ERROR lines in `/tmp/soak30_results.txt`.
+## 30-min turbo3_tcq soak — FAILED (drift/corruption found)
+
+17 turns x 3 prompts at temperature 0, 0 transport errors. Per-prompt drift
+check against an f16 A/B on the identical checkpoint + prompts:
+
+- P0 (dedup function): turbo3 == f16 quality (733 vs 734 chars, same
+  opening). Long decodes CAN stay coherent.
+- P1 (explain list comprehension): f16 609 chars coherent; turbo3 diverges
+  from the FIRST decode token ('彻底.' + whitespace, 200 chars).
+- P2 (refactor sum): f16 367 chars coherent; turbo3 whitespace-degenerate
+  (identical md5 across all 16 turns — deterministic degeneration).
+
+Token-1 divergence means the PREFILL KV is corrupted for these prompts —
+not cumulative decode drift. The battery's padding prompts (x-repeat) hid
+this: degenerate all-same-token KV encodes fine; real text KV does not.
+turbo3_tcq is NOT shippable at 32B; investigation belongs in the decode
+path (alpha_v adaptive scale, trellis encode of non-synthetic KV). turbo8
+and turbo4 batteries completed; turbo4 quality on 14B is already flagged
+(10-token limit), so treat turbo8 as the only soak-passing codec until
+each is A/B-verified.
 
 ## Quality gates already measured (torch oracle, synthetic)
 

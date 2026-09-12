@@ -379,3 +379,29 @@ added for ft-vs-llama greedy/logprob comparison.
 3. If soak shows drift: investigate decode path under sustained TCQ
    (alpha_v adaptive decode scale, materializer scratch reuse) before any
    further codec work.
+
+## SOAK VERDICT (2026-09-12 20:40): turbo3_tcq FAILS on the 32B
+
+Battery numbers landed (see docs/tcq-baseline-numbers.md) but the 30-min
+soak caught real corruption: turbo3_tcq diverges from the FIRST decode
+token on 2 of 3 soak prompts (P1: CJK junk then whitespace; P2:
+whitespace-degenerate, byte-identical md5 every turn) while f16 on the
+identical checkpoint + prompts is coherent. P0 (long codegen) is
+turbo3-fine. Conclusion: prefill-KV corruption on real-text KV under
+turbo3_tcq — NOT cumulative decode drift, and NOT caught by the synthetic
+battery (all-same-token padding KV encodes cleanly). buun's "quants will
+misbehave" caveat materialized exactly as the plan warned.
+
+Actions:
+1. turbo8 is the only codec with a passing battery; A/B it before
+   trusting turbo4 too (turbo4 already carries the 14B 10-token caveat).
+2. Investigate TCQ encode on real-text KV: trellis/Viterbi path vs the
+   torch oracle on REAL model KV (the oracle tests used synthetic
+   Gaussians + codebook extraction; nothing validated encode quality on
+   actual attention K/V distributions at 3.25 bpv).
+3. The 35B head_dim-256 work is now secondary to making turbo3_tcq (and
+   verifying turbo4) correct on 128-dim heads.
+
+Also noted: battery wall-clock for turbo8 8K (10.48s < f16 22.94s) is
+inconsistent — prefix-cache interaction suspected; re-run batteries with
+cache-busting before quoting pp/tg numbers.
