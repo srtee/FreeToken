@@ -350,3 +350,32 @@ l_out-N, attn_residual-N, ffn_moe_out-N, ffn_moe_weights_norm-N,
 attn_output-N, gate-N, conv_output_silu-N etc.); env-gated dump hooks
 in ft (model.py/moe.py/gdn.py, since removed). scripts/logit_probe.py
 added for ft-vs-llama greedy/logprob comparison.
+
+## Wave 3b done; soaks queued (2026-09-12 19:50)
+
+- Commits: dec615b (InnerQ, 3.1+3.5), 248381d (3.2 TP note+test, 3.3 cache
+  codec fields, 3.4 FTW note, kv_cost head_dim guard, corrected compression
+  table). All TCQ plan items except verification are DONE.
+- Verification runs as a Slurm dependency chain (jobs 15-19):
+  f16/turbo8/turbo4/turbo3_tcq batteries + 30-min turbo3_tcq soak on
+  Qwen2.5-Coder-32B IQ3_XXS. See soak/SLURM-PLAN.md; results land in
+  soak/results/. f16 baseline: 14940 MiB, 2K 11.78s, 8K 22.93s.
+- Slurm GPU gres drain fixed (Gres=gpu:NVIDIA_GeForce_RTX_5070_Ti:1 in
+  slurm.conf; backup .bak-20260912). Node has 8 CPUs in slurm.conf vs 28
+  real — keep --cpus-per-task low.
+
+## Next moves (priority order)
+
+1. Parse soak/results into docs/tcq-baseline-numbers.md (battery table +
+   soak verdict). Gate: no repeated output hashes / length decay in soak30.
+2. Head-dim-256 support (wave 4 candidate): the 35B (qwen35moe) has 256-dim
+   kv heads; the turbo pool rejects head_dim != 128. Extending store/
+   materialize to two 128-groups per head unlocks the 35B (7.8x compression
+   on its 10 full-attn layers). Requires: pool reshape (packed slab row =
+   head_dim/128 groups x bb), kernel entry points unchanged (they take
+   (token, group) rows), kv_cost formula update, tests. Decide after the
+   soak numbers land — turbo4 on 14B degrades past ~10 tokens; 32B battery
+   at turbo4/turbo3 is the quality signal for the 35B.
+3. If soak shows drift: investigate decode path under sustained TCQ
+   (alpha_v adaptive decode scale, materializer scratch reuse) before any
+   further codec work.
