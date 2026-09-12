@@ -141,6 +141,7 @@ class TritonAttentionBackend(BaseAttnBackend):
     ) -> torch.Tensor:
         from freetoken.kernel.triton.attention import (
             decode_paged_attention,
+            decode_paged_attention_turbo,
             extend_paged_attention,
             paged_attention,
         )
@@ -149,39 +150,54 @@ class TritonAttentionBackend(BaseAttnBackend):
         assert isinstance(metadata, TritonMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
 
-        k_raw = self.kvcache.k_cache(layer_id)
-        v_raw = self.kvcache.v_cache(layer_id)
-        kv_heads, head_dim = k_raw.shape[-2], k_raw.shape[-1]
-        assert head_dim == q.shape[-1]
-        k_cache = k_raw.view(-1, kv_heads, head_dim)
-        v_cache = v_raw.view(-1, kv_heads, head_dim)
-
         spec = attn_spec or AttentionSpec()
         indices = metadata.indices
         if spec.sliding_window is not None and metadata.swa_indices is not None:
             indices = metadata.swa_indices
         scale = spec.sm_scale if spec.sm_scale is not None else q.shape[-1] ** -0.5
-        if metadata.is_decode and q.dtype in (torch.float16, torch.bfloat16):
-            bs = metadata.indptr.numel() - 1
-            self._ensure_decode_scratch(metadata, bs, q.shape[1], q.shape[-1])
-            assert metadata.attn_logits is not None
-            assert metadata.attn_lse is not None
-            assert metadata.num_kv_splits is not None
-            return decode_paged_attention(
-                q=q,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                indptr=metadata.indptr,
-                indices=indices,
-                q_positions=metadata.q_positions,
-                attn_logits=metadata.attn_logits[:bs],
-                attn_lse=metadata.attn_lse[:bs],
-                num_kv_splits=metadata.num_kv_splits[:bs],
-                max_kv_splits=self.max_kv_splits,
-                sm_scale=scale,
-                sliding_window=spec.sliding_window,
-                sinks=spec.sinks,
-            )
+
+        pool = self.kvcache
+        if getattr(pool, "is_turbo", False):
+            # Wave-2 fused decode: read the packed slabs directly (no
+            # materializer). Prefill/extend below still materializes.
+            if metadata.is_decode and q.dtype in (torch.float16, torch.bfloat16):
+                bs = metadata.indptr.numel() - 1
+                self._ensure_decode_scratch(metadata, bs, q.shape[1], q.shape[-1])
+                assert metadata.attn_logits is not None
+                assert metadata.attn_lse is not None
+                assert metadata.num_kv_splits is not None
+                dense = pool._dense(layer_id)
+                return decode_paged_attention_turbo(
+                    q=q,
+                    k_slab=pool._k_packed[dense],
+                    v_slab=pool._v_packed[dense],
+                    indptr=metadata.indptr,
+                    indices=indices,
+                    q_positions=metadata.q_positions,
+                    attn_logits=metadata.attn_logits[:bs],
+                    attn_lse=metadata.attn_lse[:bs],
+                    num_kv_splits=metadata.num_kv_splits[:bs],
+                    max_kv_splits=self.max_kv_splits,
+                    sm_scale=scale,
+                    aux=pool.decode_aux(),
+                    codec=pool.codec,
+                    sliding_window=spec.sliding_window,
+                    sinks=spec.sinks,
+                )
+            k_m, v_m = pool.materialize(layer_id, metadata.indptr, None)
+            # materialize returns page-id-addressable rows: (tokens,
+            # kv_heads, head_dim)
+            kv_heads, head_dim = k_m.shape[-2], k_m.shape[-1]
+            assert head_dim == q.shape[-1]
+            k_cache = k_m
+            v_cache = v_m
+        else:
+            k_raw = self.kvcache.k_cache(layer_id)
+            v_raw = self.kvcache.v_cache(layer_id)
+            kv_heads, head_dim = k_raw.shape[-2], k_raw.shape[-1]
+            assert head_dim == q.shape[-1]
+            k_cache = k_raw.view(-1, kv_heads, head_dim)
+            v_cache = v_raw.view(-1, kv_heads, head_dim)
         if (
             (not metadata.is_decode)
             and q.dtype in (torch.float16, torch.bfloat16)

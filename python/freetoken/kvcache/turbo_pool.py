@@ -334,6 +334,47 @@ class TurboKVCache(MHAKVCache):
         # uint8. Backends build scratch in this dtype.
         return self._input_dtype
 
+
+    # ---- fused-decode surface (wave-2) ----------------------------------------------
+
+    def decode_aux(self) -> dict:
+        """Device-resident constant tensors the fused Triton decode kernels
+        read: seed-42 FWHT sign tables, the TCQ codebooks (K and V, zero for
+        non-TCQ codecs), and the InnerQ per-channel inverse scales. Allocated
+        once and kept alive by the pool so CUDA-graph capture can rely on the
+        addresses (wave-2 capture safety)."""
+        from freetoken.kernel.turbo_oracle import _S1, _S2
+        from freetoken.kernel.turbo_kv import _load_codebook, CODEBOOK_DIR, TCQ_CODEBOOK_FILES
+        if not hasattr(self, "_decode_aux_cache"):
+            dev = self._device
+            aux: dict = {
+                "s1": _S1.to(dev),
+                "s2": _S2.to(dev),
+                "scale_inv": torch.ones(128, dtype=torch.float32, device=dev),
+            }
+            cent = torch.tensor(
+                [-0.241556, -0.182907, -0.143047, -0.111065,
+                 -0.083317, -0.058069, -0.034311, -0.011353,
+                  0.011353,  0.034311,  0.058069,  0.083317,
+                  0.111065,  0.143047,  0.182907,  0.241556],
+                dtype=torch.float32, device=dev)
+            k_book = torch.zeros(512, dtype=torch.float32, device=dev)
+            v_book = torch.zeros(512, dtype=torch.float32, device=dev)
+            files = TCQ_CODEBOOK_FILES.get(self._codec)
+            if files is not None:
+                n = 512 if self._codec == "turbo3_tcq" else 256
+                k_book[:n] = _load_codebook(CODEBOOK_DIR / files[0], n).to(dev)
+                v_book[:n] = _load_codebook(CODEBOOK_DIR / files[1], n).to(dev)
+            aux["codebook_k"] = k_book
+            aux["codebook_v"] = v_book
+            aux["centroids4"] = cent
+            self._decode_aux_cache = aux
+        return self._decode_aux_cache
+
+    def upload_innerq_scales(self, scale_inv: torch.Tensor) -> None:
+        """Refresh the fused-decode InnerQ scales after calibration."""
+        self._decode_aux_cache["scale_inv"].copy_(scale_inv)
+
     @property
     def is_turbo(self) -> bool:
         return True
