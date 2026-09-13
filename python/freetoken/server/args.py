@@ -425,6 +425,14 @@ def parse_args(
         "and page_size=1; reads go through a dequantizing materializer.",
     )
     parser.add_argument(
+        "--spec-mtp",
+        action="store_true",
+        default=ServerArgs.spec_mtp,
+        help="MTP speculative decoding (Qwen3.5/3.6 checkpoints with an "
+        "mtp.* head): depth-1 greedy draft + verify. Eager — forces CUDA "
+        "graph exclusion. Lossless: greedy output is byte-identical.",
+    )
+    parser.add_argument(
         "--kv-codec-tune",
         type=str,
         default=ServerArgs.kv_codec_tune,

@@ -35,6 +35,7 @@ import torch.nn.functional as F
 
 from freetoken.layers.base import BaseOP
 from freetoken.layers.norm import GemmaRMSNorm
+from .attention import Qwen3_5Attention
 
 
 def _rope_neox(x: torch.Tensor, positions: torch.Tensor, rotary_dim: int,
@@ -61,7 +62,124 @@ def _rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     return weight * out
 
 
+class MTPMoE(BaseOP):
+    """Eager routed MoE (256 experts, top-8, renormalized) + gated shared
+    expert — the same math as Qwen3_5MoE in plain torch. The draft runs 1
+    token per step, so a gather-bmm over the stacked bf16 experts is the
+    right shape; the fused stacked layout matches the checkpoint's
+    mtp.layers.0.mlp.experts.{gate_up_proj,down_proj} names."""
+
+    def __init__(self, config, hidden: int, inter: int, dtype=torch.bfloat16):
+        self.top_k = config.num_experts_per_tok
+        from freetoken.layers import LinearReplicated
+        self.gate = LinearReplicated(hidden, config.num_experts, has_bias=False,
+                                     prefix="model.mtp.layer.mlp.gate")
+        E = config.num_experts
+        class _Experts(BaseOP):
+            pass
+        self.experts = _Experts()
+        self.experts.gate_up_proj = torch.zeros(E, 2 * inter, hidden, dtype=dtype)
+        self.experts.down_proj = torch.zeros(E, hidden, inter, dtype=dtype)
+        class _Shared(BaseOP):
+            pass
+        self.shared_expert = _Shared()
+        self.shared_expert.gate_proj = LinearReplicated(
+            hidden, inter, has_bias=False, prefix="model.mtp.layer.mlp.shared_expert.gate_proj")
+        self.shared_expert.up_proj = LinearReplicated(
+            hidden, inter, has_bias=False, prefix="model.mtp.layer.mlp.shared_expert.up_proj")
+        self.shared_expert.down_proj = LinearReplicated(
+            inter, hidden, has_bias=False, prefix="model.mtp.layer.mlp.shared_expert.down_proj")
+        self.shared_expert_gate = LinearReplicated(
+            hidden, 1, has_bias=False, prefix="model.mtp.layer.mlp.shared_expert_gate")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        probs = self.gate.forward(x).softmax(dim=-1)
+        top_w, top_i = probs.topk(self.top_k, dim=-1)
+        top_w = top_w / top_w.sum(dim=-1, keepdim=True)
+        gu = self.experts.gate_up_proj[top_i.reshape(-1)]
+        d = self.experts.down_proj[top_i.reshape(-1)]
+        xe = x.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, x.shape[-1])
+        h = torch.bmm(gu, xe.unsqueeze(-1)).squeeze(-1)
+        g, u = h.chunk(2, dim=-1)
+        act = F.silu(g) * u
+        out = torch.bmm(d, act.unsqueeze(-1)).squeeze(-1)
+        out = (out.view(-1, self.top_k, x.shape[-1])
+               * top_w.unsqueeze(-1)).sum(1)
+        shared = (F.silu(self.shared_expert.gate_proj.forward(x))
+                  * self.shared_expert.up_proj.forward(x))
+        shared = self.shared_expert.down_proj.forward(shared)
+        gate = torch.sigmoid(self.shared_expert_gate.forward(x))
+        return out + shared * gate
+
+
+class MTPDraftLayer(BaseOP):
+    """The draft block's decoder layer: a TRUNK Qwen3_5Attention (paged KV,
+    layer_id = num_layers — the draft's rows live in the trunk pool at the
+    extra storage layer) + the eager MTPMoE. Keys mirror
+    mtp.layers.0.{self_attn,mlp,input_layernorm,post_attention_layernorm}."""
+
+    def __init__(self, config: ModelConfig, layer_id: int, dtype=torch.bfloat16):
+        self.self_attn = Qwen3_5Attention(
+            config, layer_id, prefix="model.mtp.layer.self_attn")
+        self.mlp = MTPMoE(config, config.hidden_size,
+                          config.moe_intermediate_size, dtype)
+        self.eps = config.rms_norm_eps
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = _rms(x, self.input_layernorm, self.eps)
+        x = self.self_attn.forward(x)
+        x = x + residual
+        x = self.mlp.forward(_rms(x, self.post_attention_layernorm, self.eps))
+        return x + residual
+
+
+class MTPHead(BaseOP):
+    """Single-block MTP draft head. The draft step (spec_mtp.MTPDrafter)
+    feeds the trunk's post-norm carry + the last sampled token; the KV rows
+    land in the trunk pool at layer_id = num_layers."""
+
+    def __init__(self, config: ModelConfig, embed_tokens,
+                 *, prefix: str = "model.mtp", dtype=torch.bfloat16):
+        hidden = config.hidden_size
+        self.config = config
+        self._embed_tokens = embed_tokens
+        self._lm_head = None  # attached post-construction (shared trunk head)
+        self.eps = config.rms_norm_eps
+        layer_id = config.num_layers  # KV rows at the extra storage layer
+        # GemmaRMSNorm/Linear give the state-dict the .weight suffix the
+        # loader emits (trunk convention)
+        self.pre_fc_norm_embedding = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
+        from freetoken.layers import LinearReplicated
+        self.fc = LinearReplicated(2 * hidden, hidden, has_bias=False,
+                                   prefix="model.mtp.fc")
+        self.norm = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
+        self.layer = MTPDraftLayer(config, layer_id, dtype)
+
+    def set_lm_head(self, lm_head) -> None:
+        self._lm_head = lm_head
+
+    def draft_step(self, last_hidden_normed: torch.Tensor,
+                   input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """One draft step: embed+carry -> fc -> layer -> norm. Returns
+        (carry, logits). The caller samples and feeds the next carry."""
+        ids = input_ids.reshape(-1)
+        e = self.pre_fc_norm_embedding.forward(self._embed_tokens(ids))
+        h = self.pre_fc_norm_hidden.forward(last_hidden_normed)
+        x = self.fc.forward(torch.cat([e, h], dim=-1))
+        x = self.layer.forward(x)
+        carry = self.norm.forward(x)
+        return carry, self._lm_head.forward(carry)
+
+
 class MTPAttention(BaseOP):
+    """Wave-0 eager attention (no paged KV) — kept for the unit-level
+    numerics tests; production drafting uses MTPDraftLayer's trunk
+    Qwen3_5Attention."""
+
     def __init__(self, config, hidden: int, dtype=torch.bfloat16):
         self.num_q = config.num_qo_heads
         self.num_kv = config.num_kv_heads
@@ -79,13 +197,10 @@ class MTPAttention(BaseOP):
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor,
                 kv: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
-        # fp32 math throughout: the draft runs 1 token per step, so the
-        # GEMV cost is irrelevant, and bf16 matmul accumulation error is
-        # not (it compounds through the verify-compare loop).
         xf = x
         T = x.shape[0]
         qg = (xf @ self.q_proj.T).view(T, self.num_q, 2 * self.head_dim)
-        q, gate = qg.chunk(2, dim=-1)                      # per-head q|gate halves
+        q, gate = qg.chunk(2, dim=-1)
         k = (xf @ self.k_proj.T).view(T, self.num_kv, self.head_dim)
         v = (xf @ self.v_proj.T).view(T, self.num_kv, self.head_dim)
         q = _rms(q, self.q_norm, self.eps)
@@ -100,100 +215,10 @@ class MTPAttention(BaseOP):
         rep = self.num_q // self.num_kv
         kk = kk.repeat_interleave(rep, dim=1)
         vv = vv.repeat_interleave(rep, dim=1)
-        scores = torch.einsum("qhd,khd->hqk", q.float(), kk.float()) * self.head_dim ** -0.5
+        scores = torch.einsum("qhd,khd->hqk", q, kk) * self.head_dim ** -0.5
         attn = scores.softmax(dim=-1)
-        out = torch.einsum("hqk,khd->qhd", attn, vv.float()).reshape(T, -1).to(x.dtype)
-        # buun: attn output gated per-head BEFORE o_proj
+        out = torch.einsum("hqk,khd->qhd", attn, vv).reshape(T, -1)
         out = out * torch.sigmoid(gate.reshape(T, -1))
         return out @ self.o_proj.T
 
 
-class MTPMoE(BaseOP):
-    """Eager routed MoE (256 experts, top-8, renormalized) + gated shared
-    expert — the same math as Qwen3_5MoE in plain torch (draft runs 1
-    token; a gather-bmm over the stacked bf16 experts is the right shape)."""
-
-    def __init__(self, config, hidden: int, inter: int, dtype=torch.bfloat16):
-        self.top_k = config.num_experts_per_tok
-        self.gate = torch.zeros(config.num_experts, hidden, dtype=dtype)
-        E = config.num_experts
-        # checkpoint keys: mtp.layers.0.mlp.experts.{gate_up_proj,down_proj}
-        # (fused stacked experts, no trailing ".weight")
-        self.experts_gate_up_proj = torch.zeros(E, 2 * inter, hidden, dtype=dtype)
-        self.experts_down_proj = torch.zeros(E, hidden, inter, dtype=dtype)
-        # mtp.layers.0.mlp.shared_expert.{gate,up,down}_proj.weight
-        self.shared_expert_gate_proj = torch.zeros(inter, hidden, dtype=dtype)
-        self.shared_expert_up_proj = torch.zeros(inter, hidden, dtype=dtype)
-        self.shared_expert_down_proj = torch.zeros(hidden, inter, dtype=dtype)
-        self.shared_expert_gate = torch.zeros(1, hidden, dtype=dtype)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        probs = (x @ self.gate.T).softmax(dim=-1)
-        top_w, top_i = probs.topk(self.top_k, dim=-1)
-        top_w = top_w / top_w.sum(dim=-1, keepdim=True)
-        gu = self.experts_gate_up_proj[top_i.reshape(-1)]
-        d = self.experts_down_proj[top_i.reshape(-1)]
-        xe = x.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, x.shape[-1])
-        h = torch.bmm(gu, xe.unsqueeze(-1)).squeeze(-1)
-        g, u = h.chunk(2, dim=-1)
-        act = F.silu(g) * u
-        out = torch.bmm(d, act.unsqueeze(-1)).squeeze(-1)  # [T*k, hidden]
-        out = (out.view(-1, self.top_k, x.shape[-1])
-               * top_w.unsqueeze(-1).to(out.dtype)).sum(1)
-        shared = (F.silu(x @ self.shared_expert_gate_proj.T)
-                  * (x @ self.shared_expert_up_proj.T))
-        shared = shared @ self.shared_expert_down_proj.T
-        gate = torch.sigmoid(x @ self.shared_expert_gate.T)
-        return out + shared * gate
-
-
-class MTPDraftLayer(BaseOP):
-    """The draft block's decoder layer: attn (residual) -> post-norm -> MoE
-    (residual). Keys mirror mtp.layers.0.{self_attn,mlp,input_layernorm,
-    post_attention_layernorm}."""
-
-    def __init__(self, config, hidden: int, dtype=torch.bfloat16):
-        self.self_attn = MTPAttention(config, hidden, dtype)
-        self.mlp = MTPMoE(config, hidden, config.moe_intermediate_size, dtype)
-        self.eps = config.rms_norm_eps
-        self.input_layernorm = torch.zeros(hidden, dtype=dtype)
-        self.post_attention_layernorm = torch.zeros(hidden, dtype=dtype)
-
-    def forward(self, x: torch.Tensor, positions: torch.Tensor,
-                kv: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
-        residual = x
-        x = _rms(x, self.input_layernorm, self.eps).to(x.dtype)
-        x = self.self_attn.forward(x, positions, kv)
-        x = x + residual
-        x = self.mlp.forward(_rms(x, self.post_attention_layernorm, self.eps).to(x.dtype))
-        return x + residual
-
-
-class MTPHead(BaseOP):
-    """Single-block MTP draft head. State-dict keys mirror the loader's
-    emitted names (model.mtp.*); embedding/lm_head are the trunk's by
-    reference (passed in, not part of this module's state dict)."""
-
-    def __init__(self, config, embed_tokens, lm_head, dtype=torch.bfloat16):
-        hidden = config.hidden_size
-        self.config = config
-        self._embed_tokens = embed_tokens
-        self._lm_head = lm_head
-        self.eps = config.rms_norm_eps
-        # nextn-specific norms — buun builds them with the same RMS builder
-        # as every qwen35moe norm, i.e. Gemma (1+w) semantics
-        self.pre_fc_norm_embedding = torch.zeros(hidden, dtype=dtype)
-        self.pre_fc_norm_hidden = torch.zeros(hidden, dtype=dtype)
-        self.fc = torch.zeros(hidden, 2 * hidden, dtype=dtype)
-        self.norm = torch.zeros(hidden, dtype=dtype)
-        self.layer = MTPDraftLayer(config, hidden, dtype)
-
-    def forward(self, last_hidden_normed: torch.Tensor, input_ids: torch.Tensor,
-                positions: torch.Tensor,
-                kv: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
-        ids = input_ids.reshape(-1)
-        e = _rms(self._embed_tokens(ids), self.pre_fc_norm_embedding, self.eps)
-        h = _rms(last_hidden_normed, self.pre_fc_norm_hidden, self.eps)
-        x = (self.fc @ torch.cat([e, h], dim=-1).T).T
-        x = self.layer.forward(x, positions, kv)
-        return _rms(x, self.norm, self.eps)

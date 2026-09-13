@@ -49,31 +49,38 @@ def test_config_exposes_mtp_fields():
 
 def test_loader_routes_all_19_mtp_tensors():
     got = _iter_mtp()
-    assert len(got) == 19
+    # 19 checkpoint tensors; q/k/v fuse into one qkv_proj -> 17 emitted
+    assert len(got) == 17
     # spot-check the shapes read off the checkpoint
-    assert got["fc"].shape == (2048, 4096)
-    assert got["layer.mlp.experts_gate_up_proj"].shape == (256, 1024, 2048)
-    assert got["layer.mlp.experts_down_proj"].shape == (256, 2048, 512)
-    assert got["layer.self_attn.q_proj"].shape == (8192, 2048)
+    assert got["fc.weight"].shape == (2048, 4096)
+    assert got["layer.mlp.experts.gate_up_proj"].shape == (256, 1024, 2048)
+    assert got["layer.mlp.experts.down_proj"].shape == (256, 2048, 512)
+    # fused qkv: q (2x for gate) + k + v rows
+    assert got["layer.self_attn.qkv_proj.weight"].shape == (9216, 2048)
     # every norm got the Gemma (1+w) bake: compare against the raw
     # checkpoint value shifted by exactly +1
     from safetensors import safe_open
     with safe_open(_CKPT + "model-00003-of-00003.safetensors", framework="pt") as f:
         for mtp_key, baked_key in [
-            ("mtp.pre_fc_norm_embedding.weight", "pre_fc_norm_embedding"),
-            ("mtp.layers.0.input_layernorm.weight", "layer.input_layernorm"),
-            ("mtp.layers.0.self_attn.k_norm.weight", "layer.self_attn.k_norm"),
+            ("mtp.pre_fc_norm_embedding.weight", "pre_fc_norm_embedding.weight"),
+            ("mtp.layers.0.input_layernorm.weight", "layer.input_layernorm.weight"),
+            ("mtp.layers.0.self_attn.k_norm.weight", "layer.self_attn.k_norm.weight"),
         ]:
             raw = f.get_tensor(mtp_key).float()
             assert torch.allclose(got[baked_key].float(), raw + 1.0, atol=1e-2), baked_key
 
 
 def test_mtp_head_state_dict_matches_emitted_keys():
+    """The wave-1 MTPHead (trunk attention + eager MoE) must consume
+    exactly the emitted keys: the q/k/v fusion moved q/k/v into one
+    qkv_proj tensor, and attention norms keep their .weight suffix."""
     from freetoken.models.qwen3_5_moe.mtp import MTPHead
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
     cfg = _config()
-    emb = torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size)
-    head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
-    mtp = MTPHead(cfg, emb, head)
+    mtp = MTPHead(cfg, torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size),
+                  prefix="model.mtp")
     sd = dict(mtp.state_dict().items())
     got = _iter_mtp()
     assert set(sd) == set(got), (
@@ -81,27 +88,30 @@ def test_mtp_head_state_dict_matches_emitted_keys():
         f"emitted-only={sorted(set(got) - set(sd))}")
     for k, t in got.items():
         assert tuple(sd[k].shape) == tuple(t.shape), k
+    # the fused qkv: num_q*hd*2 + 2*num_kv*hd rows
+    assert got["layer.self_attn.qkv_proj.weight"].shape == (
+        cfg.num_qo_heads * cfg.head_dim * 2 + 2 * cfg.num_kv_heads * cfg.head_dim,
+        cfg.hidden_size)
 
 
-def test_mtp_head_forward_one_step():
+def test_mtp_head_wiring():
+    """MTPHead construction + lm_head attachment + state-dict load. The
+    draft_step execution needs the engine context (paged KV backend) —
+    its numerics gate is the wave-1 E2E (ft vs llama.cpp hidden states)."""
     from freetoken.models.qwen3_5_moe.mtp import MTPHead
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
     cfg = _config()
     torch.manual_seed(0)
     emb = torch.nn.Embedding(cfg.vocab_size, cfg.hidden_size, dtype=torch.bfloat16)
     head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False, dtype=torch.bfloat16)
-    mtp = MTPHead(cfg, emb, head)
-    # production loads cast each tensor to the model param's dtype
-    mtp.load_state_dict({k: v.to(torch.bfloat16) for k, v in _iter_mtp().items()})
-    with torch.no_grad():
-        h0 = torch.randn(1, cfg.hidden_size, dtype=torch.bfloat16)
-        tok = torch.tensor([1234])
-        pos = torch.tensor([10])
-        carry = mtp.forward(h0, tok, pos)
-        assert carry.shape == (1, cfg.hidden_size)
-        assert torch.isfinite(carry).all()
-        # logits through the (stub) head: finite, right shape
-        logits = head(carry)
-        assert logits.shape == (1, cfg.vocab_size)
-        # determinism: same inputs -> identical carry
-        carry2 = mtp.forward(h0, tok, pos)
-        assert torch.equal(carry, carry2)
+    mtp = MTPHead(cfg, emb, prefix="model.mtp")
+    mtp.set_lm_head(head)
+    assert mtp._lm_head is head
+    got = _iter_mtp()
+    sd_mod = dict(mtp.state_dict().items())
+    # production casts each tensor to the model param's dtype
+    mtp.load_state_dict({k: v.to(sd_mod[k].dtype) for k, v in got.items()})
+    # spot-check a loaded weight landed
+    assert torch.equal(mtp.fc.weight, got["fc.weight"].to(mtp.fc.weight.dtype))

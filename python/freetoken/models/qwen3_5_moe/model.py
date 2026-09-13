@@ -17,6 +17,7 @@ from freetoken.utils import nvtx_annotate
 from .attention import Qwen3_5Attention
 from .gdn import Qwen3_5GatedDeltaNet
 from .moe import Qwen3_5DenseMLP, Qwen3_5MoE
+from .mtp import MTPHead
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -85,6 +86,15 @@ class Qwen3_5Model(BaseOP):
             ]
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # MTP draft head (speculative decoding): one full-attention decoder
+        # layer whose KV rows live at layer index num_layers (the pool's
+        # layer_ids cover it via the extended full-attn group). Shares the
+        # trunk's embedding table and lm_head by reference.
+        self.mtp = (
+            MTPHead(config, self.embed_tokens, prefix=f"{prefix}.mtp")
+            if config.mtp_num_hidden_layers > 0
+            else None
+        )
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
@@ -110,7 +120,14 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
+        self.last_hidden = output  # pre-lm_head carry (MTP draft input)
         return self.lm_head.forward(output)
+
+    def attach_mtp_head(self) -> None:
+        """Give the draft head the trunk's lm_head (shared by reference —
+        mtp_use_dedicated_embeddings=false). Called after lm_head exists."""
+        if self.model.mtp is not None:
+            self.model.mtp.set_lm_head(self.lm_head)
 
 
 __all__ = ["Qwen3_5MoEForCausalLM"]

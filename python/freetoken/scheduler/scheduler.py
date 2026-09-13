@@ -869,6 +869,15 @@ class Scheduler(SchedulerIOMixin):
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         forward_output = self.engine.forward_batch(batch, sample_args)
+        # MTP depth-1 draft (decode only, greedy): compute the speculative
+        # token after the target step. The verify forward + commit/rollback
+        # land in the drain path (wave-1 remaining item); drafts are logged
+        # so the acceptance telemetry shape is exercised end-to-end.
+        # MTP depth-1 draft: wired (drafter + layer-40 KV + hidden carry)
+        # but the verify-forward + commit/rollback integration is pending
+        # (mtp-plan 1.3 batch surgery); running the draft without the
+        # verify would burn compute for nothing, so it stays off.
+        # drafter = getattr(self.engine, "mtp_drafter", None)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output

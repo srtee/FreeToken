@@ -456,6 +456,7 @@ def _iter_weights_attn_fp8(
     bf16_buf: dict[str, dict[int, torch.Tensor]] = {}
     shared_buf: dict[str, dict[str, torch.Tensor]] = {}
     nvfp4_shared_buf: dict[str, dict[str, tuple]] = {}
+    mtp_qkv_buf: dict = {}
 
     for file in tqdm(
         iter_weight_files(model_path),
@@ -471,26 +472,34 @@ def _iter_weights_attn_fp8(
                     continue  # scales consumed with their .weight
 
                 if raw_name.startswith("mtp."):
-                    # MTP draft head (mtp-plan 0.1): plain bf16, 1:1 remap to
-                    # the MTPHead module attrs (BaseOP state_dict walks plain
-                    # tensor attributes, so names drop the trailing ".weight"):
-                    #   mtp.fc.weight                    -> model.mtp.fc
-                    #   mtp.norm.weight                  -> model.mtp.norm
-                    #   mtp.pre_fc_norm_X.weight         -> model.mtp.pre_fc_norm_X
-                    #   mtp.layers.0.<rest>.weight       -> model.mtp.layer.<rest>
-                    #   mtp.layers.0.mlp.experts.<p>     -> model.mtp.layer.mlp.experts_<p>
-                    #      (fused stacked experts; the eager MTPMoE consumes [E, ...])
-                    #   mtp.layers.0.mlp.shared_expert.<p>.weight
-                    #                                    -> model.mtp.layer.mlp.shared_expert_<p>
-                    # All mtp norms are Gemma (1 + weight) — baked here.
+                    # MTP draft head (mtp-plan 0.1): plain bf16, remapped to
+                    # the MTPHead module tree. q/k/v fuse into qkv_proj (the
+                    # trunk attention's LinearColParallelMerged layout, the
+                    # gate half riding on q); experts keep the fused stacked
+                    # layout (the eager MTPMoE consumes [E, ...] directly);
+                    # every mtp norm is Gemma (1 + weight) — baked here.
                     tensor = f.get_tensor(raw_name)
                     name = raw_name[len("mtp."):]
                     if name.startswith("layers.0."):
                         name = "layer." + name[len("layers.0."):]
-                    name = name.replace(".mlp.experts.", ".mlp.experts_")
-                    name = name.replace(".mlp.shared_expert.", ".mlp.shared_expert_")
-                    if name.endswith(".weight"):
-                        name = name[: -len(".weight")]
+
+                    if ".self_attn.q_proj" in name:
+                        mtp_qkv_buf["q"] = tensor
+                        continue
+                    if ".self_attn.k_proj" in name:
+                        mtp_qkv_buf["k"] = tensor
+                        continue
+                    if ".self_attn.v_proj" in name:
+                        mtp_qkv_buf["v"] = tensor
+                        if len(mtp_qkv_buf) == 3:
+                            fused = torch.cat(
+                                [mtp_qkv_buf.pop("q"), mtp_qkv_buf.pop("k"),
+                                 mtp_qkv_buf.pop("v")], dim=0)
+                            yield "model.mtp.layer.self_attn.qkv_proj.weight", fused
+                        continue
+                    if ".self_attn.o_proj" in name:
+                        yield "model.mtp.layer.self_attn.o_proj.weight", tensor
+                        continue
                     if "norm" in name:
                         tensor = tensor + 1.0  # Gemma (1 + weight)
                     yield "model.mtp." + name, tensor

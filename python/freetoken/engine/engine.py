@@ -348,6 +348,17 @@ class Engine:
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
+        # MTP speculative decoding: the draft head + lm_head wiring. The
+        # drafter owns the draft step; the verify-forward + bookkeeping
+        # live in the scheduler hook.
+        self.mtp_drafter = None
+        if getattr(config, "spec_mtp", False):
+            if getattr(config.model_config, "mtp_num_hidden_layers", 0) == 0:
+                raise ValueError("--spec-mtp requires a checkpoint with an mtp.* head")
+            if hasattr(self.model, "attach_mtp_head"):
+                self.model.attach_mtp_head()
+            from freetoken.engine.spec_mtp import MTPDrafter
+            self.mtp_drafter = MTPDrafter(self)
 
         # ======================= KV cache initialization ========================
         new_free = self._sync_get_memory()[1]
@@ -422,8 +433,10 @@ class Engine:
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
-            cuda_graph_max_bs=config.cuda_graph_max_bs,
+            # MTP spec decoding runs the draft/verify eagerly; wave 2
+            # restores capture for the draft+verify graphs.
+            cuda_graph_bs=(None if config.spec_mtp else config.cuda_graph_bs),
+            cuda_graph_max_bs=(0 if config.spec_mtp else config.cuda_graph_max_bs),
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,
@@ -914,6 +927,7 @@ class Engine:
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        self.last_hidden = getattr(self.model, "last_hidden", None)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.

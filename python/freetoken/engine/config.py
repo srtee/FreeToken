@@ -98,6 +98,9 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # MTP speculative decoding (Qwen3.5/3.6 checkpoints with an mtp.* head):
+    # depth-1 greedy draft + verify, eager (forces CUDA-graph exclusion).
+    spec_mtp: bool = False
 
     def __post_init__(self):
         if self.kv_codec_tune != "none" and self.kv_codec == "f16":

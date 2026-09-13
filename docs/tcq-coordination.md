@@ -514,3 +514,32 @@ splits the LAST axis (trans before/after to reach the pair axis).
   omp -p injects a ~20k-token system prompt vs the coder's 12k KV cap
   (VRAM-bound; 16k+ OOMs). Raised KV to 12288 tokens + fixed the omp
   provider baseUrl (1918 -> 1919) and registry entry.
+
+## MTP Wave 1 — engine plumbing + draft/verify design (2026-09-13)
+
+Landed (commit after 8da83f9):
+- config: full-attn group extended with the MTP layer index (40) —
+  attn_type(40)=FULL, the pool's layer_ids cover it (pool sized to
+  num_layers + mtp_num_hidden_layers).
+- model: Qwen3_5Model.mtp (MTPHead, prefix model.mtp) sharing the trunk
+  embedding; lm_head attached post-construction (attach_mtp_head).
+- mtp.py restructured for production: MTPDraftLayer reuses the TRUNK
+  Qwen3_5Attention (paged KV at layer_id=40, qkv fusion via the loader,
+  o_proj LinearReplicated) + the eager MTPMoE (fused stacked experts).
+  MTPHead.draft_step(carry, token) -> (carry', logits).
+- engine: --spec-mtp flag (ServerArgs/EngineConfig/CLI), MTPDrafter
+  construction, last_hidden exposure, graph exclusion (cuda_graph 0).
+- spec_mtp.py: verify_chain greedy acceptance logic (unit-tested:
+  all-accept, first-reject, mid-chain-stop, batch independence) +
+  SpecStats + MTPDrafter.draft.
+
+PARKED (the invasive remainder): the verify forward + commit/rollback.
+The draft hook runs but is parked (drafter wired; verify-batch surgery
+pending — running draft-without-verify burns compute for nothing).
+First integration attempt hit two real issues, both fixed or understood:
+(a) VocabParallelEmbedding is forward()-called, (b) the draft must run
+on the engine stream inside forward_batch (the post-forward hook hung
+the decode loop). Verify batch design settled: 2 rows/req
+([t_next, d]), accept iff row-A argmax == d, rollback row-B KV +
+device_len on reject; losslessness by construction (greedy argmax
+comparison at the same position).

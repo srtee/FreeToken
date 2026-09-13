@@ -195,6 +195,15 @@ def parse_config(hf_config: Any) -> ModelConfig:
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
+    mtp_layers = getattr(text, "mtp_num_hidden_layers", 0) or 0
+    if mtp_layers:
+        # The MTP draft head is a full-attention decoder layer whose KV rows
+        # live at layer index num_layers..num_layers+mtp_layers-1 (the trunk
+        # pool allocates the extra storage layers; the draft reuses the same
+        # pool and page table).
+        full_ids = full_ids + tuple(
+            len(layer_types) + i for i in range(mtp_layers)
+        )
 
     full_rotary = RotaryConfig(
         head_dim=head_dim,

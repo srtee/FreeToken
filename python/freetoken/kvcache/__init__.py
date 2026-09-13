@@ -274,11 +274,21 @@ def create_kvcache_pool(
         if kv_codec_tune == "innerq":
             pool.arm_innerq_calibration()
         return pool
+    # The MTP draft head's KV rows live at layer index num_layers (one per
+    # mtp layer) — the extended full-attn group's layer_ids include them,
+    # so the pool must size its storage to cover them.
+    n_pool_layers = model_config.num_layers + (
+        getattr(model_config, "mtp_num_hidden_layers", 0) or 0
+    )
     return MHAKVCache(
         num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
-        num_layers=model_config.num_layers,
+        num_layers=max(
+            model_config.num_layers,
+            len(layer_ids) if layer_ids is not None else 0,
+            model_config.num_layers + (model_config.mtp_num_hidden_layers or 0),
+        ),
         head_dim=spec.head_dim if spec is not None else model_config.head_dim,
         device=device,
         dtype=dtype,
