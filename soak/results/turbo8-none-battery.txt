@@ -1,0 +1,4 @@
+codec=turbo8 tune=none vram_mib=13920
+codec=turbo8 ctx=2k wall_s=23.15
+codec=turbo8 ctx=8k wall_s=10.48
+codec=turbo8 done

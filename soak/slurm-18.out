@@ -1,0 +1,4 @@
+codec=turbo3_tcq tune=none vram_mib=13300
+codec=turbo3_tcq ctx=2k wall_s=23.51
+codec=turbo3_tcq ctx=8k wall_s=24.29
+codec=turbo3_tcq done
