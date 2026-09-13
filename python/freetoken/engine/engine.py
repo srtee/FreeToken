@@ -20,6 +20,7 @@ from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
+from freetoken.engine.spec_mtp import batch_resolve
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
@@ -291,7 +292,12 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
-
+    # MTP spec decode (wave 2): extra emitted tokens per request for the
+    # drain, beyond next_tokens (which is itself the FIRST emitted token:
+    # the draft d on accept, the corrected a on reject). [B, 1] int32,
+    # -1-padded: on accept = the bonus token; on reject = -1. None on
+    # plain (non-spec) batches — the drain falls back to single-token.
+    spec_extra_tokens_cpu: "torch.Tensor | None" = None
 
 class Engine:
     def __init__(self, config: EngineConfig):
@@ -348,9 +354,9 @@ class Engine:
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
-        # MTP speculative decoding: the draft head + lm_head wiring. The
-        # drafter owns the draft step; the verify-forward + bookkeeping
-        # live in the scheduler hook.
+        # MTP speculative decoding: the drafter owns the eager spec loop
+        # (draft -> 2-row verify -> resolve -> rollback) run inside
+        # forward_batch by the scheduler's verify batches (wave 2 Stage 1).
         self.mtp_drafter = None
         if getattr(config, "spec_mtp", False):
             if getattr(config.model_config, "mtp_num_hidden_layers", 0) == 0:
@@ -924,6 +930,34 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        if self._spec_armed(batch):
+            return self._forward_spec_batch(batch)
+        return self._forward_plain_batch(batch, args)
+
+    def _spec_armed(self, batch: Batch) -> bool:
+        """Mirror of the scheduler's gate (the scheduler routes first; this
+        guards a direct engine call). Stage-1 rows are sequential 1-row
+        verify batches (GDN stream-order property Stage 3 must re-prove);
+        page_size == 1 required (the reject frees a mid-page slot
+        otherwise); carries must be pending."""
+        return (
+            self.mtp_drafter is not None
+            and batch.is_decode
+            and self.ctx.page_size == 1
+            and all(r.sampling_params.is_greedy and r.spec_carry is not None
+                    and (r.max_device_len - r.device_len) >= 2
+                    for r in batch.reqs)
+        )
+
+    def _forward_plain_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        import os
+        if os.environ.get("FT_DEBUG_STORE") and batch.is_decode:
+            import sys
+            lens = [r.extend_len for r in batch.padded_reqs]
+            print(f"[plain] bs={batch.size} padded={batch.padded_size} "
+                  f"extend_lens={lens} linear_idx="
+                  f"{tuple(batch.linear_table_idx.shape) if batch.linear_table_idx is not None else None}",
+                  file=sys.stderr)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
@@ -933,6 +967,10 @@ class Engine:
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
 
+        # The prefill replay needs each req's ACTUAL extend span, which
+        # complete_one() destroys below (cached = device, device + 1 ->
+        # extend_len collapses to 1). Capture before.
+        prefill_lens = [req.extend_len for req in batch.reqs] if batch.is_prefill else None
         for req in batch.reqs:
             req.complete_one()
 
@@ -941,9 +979,220 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
+        if batch.is_prefill and self.mtp_drafter is not None:
+            self._stage_spec_prefill(batch, next_tokens_gpu, prefill_lens)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
+    def _stage_spec_prefill(self, batch: Batch, next_tokens_gpu,
+                            prefill_lens) -> None:
+        """Prefill stash (the loop's entry condition): replay the prefill
+        rows through the MTP head (layer-40 KV rows for the whole prompt —
+        see the replay comment below) and arm each req's FIRST spec
+        iteration — carry = the trunk's post-norm hidden at the req's
+        last prefill row (buun: prefill process()'s final h_nextn row;
+        speculative.cpp:2934-2936 + 2942-2983), next input = the sampled
+        token (dp.id_last). The row offset is the req's own extend: real
+        req rows come first in last_hidden (padded rows trail), each req's
+        LAST row is its extend_len-th. Greedy-only reqs stage; others stay
+        None and decode plain (the arm gate re-checks per batch)."""
+        hidden = self.last_hidden
+        if hidden is None:
+            return
+        # Prefill replay (semantics doc Q1 + Q4 — buun process() on the
+        # target batch, speculative.cpp:2841-2918): the MTP draft's
+        # attention attends over the layer-40 KV DENSELY, so a row must
+        # exist for EVERY prompt position before the first draft. Row i
+        # processes token i with the predecessor's target hidden (row 0 =
+        # the pending carry; cold start = zero, speculative.cpp:2881-2885
+        # — chunked continuations receive the previous chunk's last hidden
+        # as the pending carry). KV writes are the only consumed output.
+        mtp = self.model.model.mtp
+        # ONE whole-batch replay (buun process() shape, speculative.cpp:
+        # 2903): all reqs' rows go through the MTP head in a single
+        # forward under the prefill batch's own ctx (out_loc/positions/
+        # attn_metadata all describe exactly these rows). A per-req loop
+        # would hand each replay a 1-req k/v against the WHOLE batch's
+        # out_loc -> the store-shape mismatch that crashed the gate.
+        offset = 0
+        carry_parts = []
+        for i, req in enumerate(batch.reqs):
+            n = prefill_lens[i]
+            if n <= 0:
+                continue
+            rows = slice(offset, offset + n)
+            h_tgt = hidden[rows]
+            if req.spec_carry is not None:
+                # chunked continuation: the previous chunk's pending carry
+                head_carry = req.spec_carry.unsqueeze(0)
+            else:
+                head_carry = torch.zeros(
+                    (1, h_tgt.shape[-1]), dtype=h_tgt.dtype, device=h_tgt.device)
+            carry_parts.append(torch.cat([head_carry, h_tgt[: n - 1]], dim=0))
+            offset += n
+        if carry_parts:
+            carries = torch.cat(carry_parts, dim=0)
+            tokens = batch.input_ids[: carries.shape[0]]
+            with self.ctx.forward_batch(batch):
+                mtp.forward_rows(carries, tokens, with_logits=False)
+        # per-req stash (the loop's entry state)
+        offset = 0
+        for i, req in enumerate(batch.reqs):
+            n = prefill_lens[i]
+            if n <= 0:
+                continue
+            req.spec_carry = hidden[offset + n - 1]
+            # The sampler ran on this stream; the value is produced in
+            # order. The host read syncs the stream (~the drain's own
+            # copy_done cost — acceptable eager overhead, Stage 1).
+            req.spec_next_input = int(next_tokens_gpu[i].item())
+            offset += n
+
     @torch.inference_mode()
+
+    # ------------------------------------------------------------------
+    # MTP spec loop (wave 2 Stage 1, eager). The verify forward runs as a
+    # phase="prefill" extend batch built by the scheduler (2 rows/req
+    # through the SAME allocation + prepare_metadata machinery), so the
+    # trunk, the GDN chunk kernel, and the attention extend path all see
+    # a multi-row extend. Per iteration (semantics doc pseudocode):
+    #   verify rows [c@q, d@q+1]  ->  accept iff rowA argmax == d
+    #     accept: emit [d, bonus]; next input = bonus; carry = row B hidden
+    #     reject: emit [a]; next input = a; carry = row A hidden; roll
+    #             back row B (page-slot free + GDN restore + device_len
+    #             rewind; the next iteration re-processes the undone
+    #             position as its verify row A)
+    # The MTP replay (layer-40 rows for q and q+1) runs right after the
+    # verify forwards, per-row carries per buun process()
+    # (speculative.cpp:2865-2885). ALL req mutation completes before this
+    # returns (the overlap scheduler prepares the next batch afterwards).
+    # ------------------------------------------------------------------
+    def _forward_spec_batch(self, batch: Batch) -> ForwardOutput:
+        drafter = self.mtp_drafter
+        mtp = self.model.model.mtp
+        bs = batch.size
+        # One trunk forward per verify row (row A: [bs] rows, row B: [bs]
+        # rows — separate extends so each row's GDN state lands in stream
+        # order and the per-row hidden is directly addressable). Each row
+        # batch carries its own page slots, positions, and out_loc; the
+        # model.forward() consumes the batch ctx.
+        row_hiddens: list[torch.Tensor] = []
+        row_logits: list[torch.Tensor] = []
+        import os as _os
+        for row_idx, row_batch in enumerate(batch.spec_row_batches):
+            with self.ctx.forward_batch(row_batch):
+                row_logits_i = self.model.forward()
+            if _os.environ.get("FT_DEBUG_STORE"):
+                import sys as _sys
+                for i, wr in enumerate(row_batch.reqs):
+                    print(f"[row{row_idx}] uid={wr._req.uid} "
+                          f"tok={int(row_batch.input_ids[i])} "
+                          f"pos={int(row_batch.positions[i])} "
+                          f"cached={wr.cached_len} dev={wr.device_len} "
+                          f"argmax={int(row_logits_i[i].argmax())}",
+                          file=_sys.stderr)
+            # lm_head returns ONLY the keep-last-row logits for a decode
+            # batch; the spec decode keeps every row (spec_rows_keep_all),
+            # so the full [bs] (or [2bs]) logits/hidden are addressable.
+            row_logits.append(row_logits_i[:bs])
+            row_hiddens.append(self.model.last_hidden[:bs])
+            if row_idx == 0 and batch.spec_gdn_snapshot_slots:
+                # MID-VERIFY GDN SNAPSHOT (defect-2 fix): the state after
+                # row A (position q processed) is exactly what a reject's
+                # committed frontier [0, q+1) needs. The pre-verify
+                # snapshot was one row stale vs cached_len = q+1 — the
+                # GDN state lagged the KV/bookkeeping by one row under
+                # rejects (the repetition-loop corruption). Runs on the
+                # engine stream, program-ordered after row A's kernels.
+                pool = self.linear_state_pool
+                if pool is not None:
+                    for req, snap_slot in zip(
+                            batch.reqs, batch.spec_gdn_snapshot_slots):
+                        pool.copy_from(req.linear_slot_idx, snap_slot)
+        drafter.stats.drafted += bs
+        row_a = row_logits[0].argmax(dim=-1).to(torch.int32)
+        row_b = row_logits[1].argmax(dim=-1).to(torch.int32)
+        drafts = torch.tensor([r.spec_draft for r in batch.reqs],
+                              dtype=torch.int32, device=self.device)
+        import os as _os
+        if _os.environ.get("FT_DEBUG_STORE"):
+            import sys as _sys
+            print(f"[resolve] a={row_a.tolist()} b={row_b.tolist()} "
+                  f"d={drafts.tolist()}", file=_sys.stderr)
+        steps = batch_resolve(row_a, row_b, drafts)
+        drafter.stats.accepted += sum(s.accepted for s in steps)
+        carry = torch.stack(
+            [row_hiddens[s.carry_row][i] for i, s in enumerate(steps)], dim=0)
+        # MTP replay: layer-40 rows for BOTH verify positions in one
+        # batched forward (rows [c@q, d@q+1]; per-row carries: row 0 =
+        # the pending carry, row 1 = row A's trunk hidden). Replay
+        # outputs other than the KV writes are discarded.
+        replay_tokens = torch.stack(
+            [batch.spec_input_tokens_gpu, drafts], dim=1).reshape(-1)
+        replay_carries = torch.stack(
+            [batch.spec_carry_gpu, row_hiddens[0]], dim=1).reshape(2 * bs, -1)
+        replay_batch = self._mtp_replay_batch(batch)
+        with self.ctx.forward_batch(replay_batch):
+            mtp.forward_rows(replay_carries, replay_tokens, with_logits=False)
+        return self._build_spec_output(batch, steps, carry, drafts)
+
+    def _mtp_replay_batch(self, batch: Batch) -> Batch:
+        """A phase="decode" bookkeeping batch for the 2-row MTP replay:
+        positions from the verify rows, out_loc from the verify slots.
+        The MTP replay runs through MTPDraftLayer's Qwen3_5Attention,
+        which stores layer-40 KV via the trunk pool using out_loc."""
+        replay = Batch(reqs=list(batch.reqs), phase="prefill")
+        replay.padded_reqs = batch.padded_reqs
+        replay.input_ids = batch.spec_replay_input_ids
+        replay.positions = batch.spec_replay_positions
+        replay.out_loc = batch.spec_replay_out_loc
+        replay.attn_metadata = batch.spec_replay_attn_metadata
+        return replay
+
+    def _build_spec_output(self, batch: Batch, steps, carry: torch.Tensor,
+                           drafts: torch.Tensor) -> ForwardOutput:
+        """The spec batch's ForwardOutput: next_tokens = the FIRST emitted
+        token (GPU, for the scheduler's token_pool write mapping — the
+        last verify position), plus the drain's per-req extra emissions.
+
+        Per req (loop model / semantics doc Q3):
+          accept: emitted = [d, bonus] — next_tokens = d, extra = bonus.
+          reject: emitted = [a]        — next_tokens = a, extra = -1.
+        The reject's rollback (page-slot free, GDN restore, device_len
+        rewind) is applied by the caller right after this returns — it
+        must happen before the next batch is PREPARED (the drain runs
+        after the next batch's launch under overlap, so the scheduler
+        rolls back inside _forward, before filter_reqs).
+
+        Also: the per-req spec-carry refresh (req.spec_carry) and the
+        pending bonus are staged here on the reqs; all host-visible.
+        """
+        bs = batch.size
+        device = self.device
+        first = torch.tensor(
+            [s.emitted[0] for s in steps], dtype=torch.int32, device=device)
+        extra = torch.tensor(
+            [(s.emitted[1] if s.accepted else -1) for s in steps],
+            dtype=torch.int32, device=device)
+        next_input = torch.tensor(
+            [s.next_input for s in steps], dtype=torch.int32, device=device)
+        accepted = torch.tensor([s.accepted for s in steps],
+                                dtype=torch.bool, device=device)
+        # Stage the next iteration's spec state on the reqs (host-visible
+        # bookkeeping; the scheduler drain + next _prepare_batch consume).
+        carry_cpu = carry.to("cpu", non_blocking=True)
+        for i, req in enumerate(batch.reqs):
+            req.spec_next_input = int(next_input[i].item())
+            req.spec_carry = carry_cpu[i]
+            req.spec_accepted = bool(accepted[i].item())
+        copy_done = torch.cuda.Event()
+        copy_done.record(self.stream)
+        return ForwardOutput(
+            next_tokens_gpu=first,
+            next_tokens_cpu=first.to("cpu", non_blocking=True),
+            copy_done_event=copy_done,
+            spec_extra_tokens_cpu=extra.to("cpu", non_blocking=True),
+        )
+
     def _warmup_prefill(self) -> None:
         """Compile the Triton prefill path before the first real request.
 

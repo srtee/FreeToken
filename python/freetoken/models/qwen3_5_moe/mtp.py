@@ -92,24 +92,40 @@ class MTPMoE(BaseOP):
         self.shared_expert_gate = LinearReplicated(
             hidden, 1, has_bias=False, prefix="model.mtp.layer.mlp.shared_expert_gate")
 
+    _MOE_CHUNK_ROWS = 8
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         probs = self.gate.forward(x).softmax(dim=-1)
         top_w, top_i = probs.topk(self.top_k, dim=-1)
         top_w = top_w / top_w.sum(dim=-1, keepdim=True)
-        gu = self.experts.gate_up_proj[top_i.reshape(-1)]
-        d = self.experts.down_proj[top_i.reshape(-1)]
-        xe = x.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, x.shape[-1])
-        h = torch.bmm(gu, xe.unsqueeze(-1)).squeeze(-1)
-        g, u = h.chunk(2, dim=-1)
-        act = F.silu(g) * u
-        out = torch.bmm(d, act.unsqueeze(-1)).squeeze(-1)
-        out = (out.view(-1, self.top_k, x.shape[-1])
-               * top_w.unsqueeze(-1)).sum(1)
+        # The expert gather materializes top_k [inter x 3*inter-ish] weight
+        # slices PER ROW — memory is rows x top_k x the gathered slabs. The
+        # prefill replay feeds this up to max_extend_tokens (8192) rows at
+        # once, which OOMs a 16G card (480 MiB alloc on top of a full
+        # server). Per-row math is independent, so chunk the row dim:
+        # bit-identical output, bounded transient.
+        rows = x.shape[0]
+        routed = torch.empty(
+            (rows, x.shape[-1]), dtype=x.dtype, device=x.device)
+        for s in range(0, rows, self._MOE_CHUNK_ROWS):
+            e = min(s + self._MOE_CHUNK_ROWS, rows)
+            xs = x[s:e]
+            gu = self.experts.gate_up_proj[top_i[s:e].reshape(-1)]
+            d = self.experts.down_proj[top_i[s:e].reshape(-1)]
+            k = e - s
+            xe = xs.unsqueeze(1).expand(-1, self.top_k, -1).reshape(
+                -1, xs.shape[-1])
+            h = torch.bmm(gu, xe.unsqueeze(-1)).squeeze(-1)
+            g, u = h.chunk(2, dim=-1)
+            act = F.silu(g) * u
+            out = torch.bmm(d, act.unsqueeze(-1)).squeeze(-1)
+            routed[s:e] = (out.view(k, self.top_k, xs.shape[-1])
+                           * top_w[s:e].unsqueeze(-1)).sum(1)
         shared = (F.silu(self.shared_expert.gate_proj.forward(x))
                   * self.shared_expert.up_proj.forward(x))
         shared = self.shared_expert.down_proj.forward(shared)
         gate = torch.sigmoid(self.shared_expert_gate.forward(x))
-        return out + shared * gate
+        return routed + shared * gate
 
 
 class MTPDraftLayer(BaseOP):
@@ -129,10 +145,10 @@ class MTPDraftLayer(BaseOP):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
-        x = _rms(x, self.input_layernorm, self.eps)
+        x = self.input_layernorm.forward(x)
         x = self.self_attn.forward(x)
         x = x + residual
-        x = self.mlp.forward(_rms(x, self.post_attention_layernorm, self.eps))
+        x = self.mlp.forward(self.post_attention_layernorm.forward(x))
         return x + residual
 
 
@@ -162,17 +178,39 @@ class MTPHead(BaseOP):
     def set_lm_head(self, lm_head) -> None:
         self._lm_head = lm_head
 
+    def forward_rows(self, carries: torch.Tensor, input_ids: torch.Tensor,
+                    *, with_logits: bool) -> torch.Tensor:
+        """Batched MTP forward over N rows (buun process() replay shape,
+        speculative.cpp:2865-2885): row i processes token i with carry i.
+        The per-row carry is whatever the caller staged (row 0 = the pending
+        carry, row 1 = the predecessor row's trunk hidden). Writes the
+        layer-40 KV rows for every row in one attention pass — the dense-row
+        invariant mechanism for the verify positions q, q+1.
+
+        with_logits=False (replay): outputs other than the KV writes are
+        discarded; no lm_head pass. with_logits=True: per-row logits via the
+        shared lm_head (the draft path's 1-row shape is the N=1 case).
+        """
+        ids = input_ids.reshape(-1)
+        import os as _os
+        if _os.environ.get("FT_DEBUG_STORE"):
+            import sys as _sys
+            print(f"[mtp] carries={tuple(carries.shape)} ids={tuple(ids.shape)}",
+                  file=_sys.stderr)
+        e = self.pre_fc_norm_embedding.forward(self._embed_tokens.forward(ids))
+        h = self.pre_fc_norm_hidden.forward(carries)
+        x = self.fc.forward(torch.cat([e, h], dim=-1))
+        x = self.layer.forward(x)
+        carry = self.norm.forward(x)
+        if with_logits:
+            return carry, self._lm_head.forward(carry)
+        return carry
+
     def draft_step(self, last_hidden_normed: torch.Tensor,
                    input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """One draft step: embed+carry -> fc -> layer -> norm. Returns
         (carry, logits). The caller samples and feeds the next carry."""
-        ids = input_ids.reshape(-1)
-        e = self.pre_fc_norm_embedding.forward(self._embed_tokens(ids))
-        h = self.pre_fc_norm_hidden.forward(last_hidden_normed)
-        x = self.fc.forward(torch.cat([e, h], dim=-1))
-        x = self.layer.forward(x)
-        carry = self.norm.forward(x)
-        return carry, self._lm_head.forward(carry)
+        return self.forward_rows(last_hidden_normed, input_ids, with_logits=True)
 
 
 class MTPAttention(BaseOP):

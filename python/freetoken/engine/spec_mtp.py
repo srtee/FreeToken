@@ -54,6 +54,145 @@ def verify_chain(target_argmaxes: torch.Tensor,
     # a later draft is only valid if every earlier one was accepted
     return accepted.cumprod(dim=1, dtype=torch.int32)
 
+@dataclass
+class PerReqStep:
+    """The per-request resolve outcome for one spec iteration (depth 1).
+
+    Mirrors tests/engine/test_mtp_loop.py's IterationResult / the semantics
+    doc's pseudocode exactly:
+      accept (row-A argmax == draft): emit [draft, bonus]; next input =
+      bonus; carry = row-B hidden; no rollback.
+      reject: emit [row-A argmax]; next input = it; carry = row-A hidden;
+      roll back row B (free its page slot, rewind device_len, restore GDN).
+    """
+    accepted: bool
+    draft_token: int           # the drafted token d (always present)
+    emitted: tuple[int, ...]   # (d, bonus) on accept, (a,) on reject
+    next_input: int            # bonus on accept, row-A argmax on reject
+    carry_row: int             # 1 (row B) on accept, 0 (row A) on reject
+
+
+def resolve_step(row_a_argmax: int, row_b_argmax: int,
+                 draft_token: int) -> PerReqStep:
+    """Depth-1 resolve (pure logic, CPU-testable): accept iff the verify
+    row-A argmax equals the draft."""
+    if row_a_argmax == draft_token:
+        return PerReqStep(
+            accepted=True, draft_token=draft_token,
+            emitted=(draft_token, row_b_argmax), next_input=row_b_argmax,
+            carry_row=1)
+    return PerReqStep(
+        accepted=False, draft_token=draft_token,
+        emitted=(row_a_argmax,), next_input=row_a_argmax, carry_row=0)
+
+
+def batch_resolve(row_a_argmaxes: torch.Tensor, row_b_argmaxes: torch.Tensor,
+                  drafts: torch.Tensor) -> list[PerReqStep]:
+    """Batched depth-1 resolve. [B] int tensors each; returns one
+    PerReqStep per request. Row-B argmax is computed for every request
+    (the verify forward yields it regardless); it is only *meaningful* on
+    the accept side."""
+    a = row_a_argmaxes.tolist()
+    b = row_b_argmaxes.tolist()
+    d = drafts.tolist()
+    return [resolve_step(a[i], b[i], d[i]) for i in range(len(a))]
+
+@dataclass
+class SpecResult:
+    """One spec iteration's batch outcome (the engine-side SpecStep result).
+
+    next_input: [B] int32 — the token the NEXT decode iteration consumes
+    (the certain input at position q+2 after accept, q+1 after reject).
+    carry: [B, H] — the trunk hidden the next draft consumes (row B's on
+    accept, row A's on reject — the semantics doc's Q2).
+    emitted_tokens: [B, 2] padded with -1: (draft, bonus) on accept,
+    (a, -1) on reject. emitted_lens: [B] — 2 or 1.
+    rollback: [B] bool — reject requests needing the row-B rollback.
+    """
+    next_input: torch.Tensor
+    carry: torch.Tensor
+    emitted_tokens: torch.Tensor
+    emitted_lens: torch.Tensor
+    accepted: torch.Tensor
+    rollback: torch.Tensor
+
+    @property
+    def drafted(self) -> int:
+        return int(self.emitted_tokens.shape[0])
+
+    @property
+    def n_accepted(self) -> int:
+        return int(self.accepted.sum().item())
+
+    @property
+    def rate(self) -> float:
+        d = self.drafted
+        return self.n_accepted / d if d else 0.0
+
+
+def commit_reqs(reqs, result: SpecResult) -> None:
+    """Advance the reqs to the next iteration's input state from a
+    SpecResult (pure bookkeeping; mirrors the loop model's device_len/q
+    arithmetic). Complete pre-condition: the verify forward already
+    advanced each req by 2 device positions (complete_one-style, called
+    twice — see forward_batch's spec arm); this fn consumes that state.
+
+    Per req i (all on host tensors, mirroring complete_one + append_host):
+      accept: emit [d, b]; append both; next input = b; the req now sits
+              at device_len = q+2 with cached_len advanced past row B —
+              the bonus b is the input at q+2 (one past the written
+              region; next iteration's 2-slot advance allocates it).
+      reject: emit [a]; append it; next input = a; rewind device_len by 1
+              (row B's position un-commits — the caller frees the page
+              slot / restores GDN state via the returned rollback mask).
+    """
+    emitted = result.emitted_tokens.tolist()
+    lens = result.emitted_lens.tolist()
+    accepted = result.accepted.tolist()
+    rollback = result.rollback.tolist()
+    next_input = result.next_input.tolist()
+    for i, req in enumerate(reqs):
+        req.append_host(
+            torch.tensor(emitted[i][: lens[i]], dtype=req.input_ids.dtype))
+        if rollback[i]:
+            # Row B's KV page slot is freed by the caller (needs the page
+            # table); here the device_len rewind: the req's frontier moves
+            # back by 1 so the next iteration re-processes the corrected
+            # position as its verify row A.
+            req.device_len -= 1
+            req.cached_len -= 0  # cached_len was already advanced to q
+        # The next input token rides on the req: it is written by the
+        # scheduler drain's append_host path? No — the drain appends the
+        # EMITTED tokens. The NEXT INPUT token is the last emitted token
+        # by construction (accept: next == bonus == last emitted; reject:
+        # next == a == the only emitted), so the drain's appends produce
+        # exactly the state the next iteration consumes. assert it.
+        assert req.input_ids[-1].item() == next_input[i], (
+            f"spec loop invariant violated: last emitted token "
+            f"{req.input_ids[-1].item()} != next input {next_input[i]}")
+
+class SpecStep:
+    """The eager spec loop owner: draft -> verify (2-row trunk forward)
+    -> resolve -> rollback, on the engine stream, inside forward_batch.
+
+    Built once at engine init (like MTPDrafter); forward_batch calls
+    run() when the spec arm fires. Pure bookkeeping lives in the module
+    functions above (CPU-testable); the GPU-adjacent steps (the 2-row
+    batch build, the trunk forward, the MTP replay) live here.
+    """
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.mtp = engine.model.model.mtp
+        assert self.mtp is not None, "--spec-mtp requires an MTP-capable checkpoint"
+        self.stats = SpecStats()
+
+    def draft(self, carry: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        """Batched 1-row MTP draft: [B, H] carry + [B] tokens -> [B] drafts."""
+        _, logits = self.mtp.draft_step(carry, tokens)
+        return logits.argmax(dim=-1).to(torch.int32)
+
+
 class MTPDrafter:
     """Runs the MTP draft step after the target decode step. The verify
     forward + req bookkeeping live in the scheduler hook (the verify batch

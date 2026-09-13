@@ -61,7 +61,10 @@ def _setup():
         eos_token_ids=set(),
         toolcall_anchor_id=None,
         config=SimpleNamespace(page_size=1),
-        status_reporter=SimpleNamespace(report_batch=lambda *_, **__: None),
+        status_reporter=SimpleNamespace(
+            report_batch=lambda *_, **__: None,
+            count_generated_tokens=lambda *_: None,
+        ),
         send_result=sent.extend,
         _kv_usage_pages=cm.page_usage,
         _mamba_slot_usage=lambda: None,
@@ -70,6 +73,7 @@ def _setup():
         _match_stop_str=lambda _req: None,
         _pending_abort_acks=set(),
         _last_data=None,
+        engine=SimpleNamespace(page_table=pt),
     )
     stub._free_req_resources = lambda req: Scheduler._free_req_resources(stub, req)
     return pool, cm, tm, dm, pm, sent, stub
@@ -97,7 +101,7 @@ def _as_last_data(batch):
     return (
         SimpleNamespace(batch=batch),
         (None, torch.tensor([42], dtype=torch.int32),
-         SimpleNamespace(synchronize=lambda: None)),
+         SimpleNamespace(synchronize=lambda: None), None),
     )
 
 

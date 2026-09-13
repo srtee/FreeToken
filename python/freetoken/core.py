@@ -63,6 +63,35 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # --- MTP spec decode (wave 2, depth-1): per-request loop state. ---
+    # Pending MTP carry: the trunk hidden (post-norm, [H]) the next draft
+    # consumes. Set after prefill (= the prefill's last hidden row) and
+    # refreshed by every spec resolve (row B's hidden on accept, row A's on
+    # reject). None = draft is not armed for this req (degrade to plain
+    # decode — buun's not-ready draft skip, speculative.cpp:2960-2964).
+    spec_carry: "torch.Tensor | None" = None
+    # Spec arm state for the NEXT decode batch: the number of leading
+    # certain-row re-processes the verify forward must run BEFORE the
+    # drafted row. 0 = normal (rows [c@q, d@q+1]); after a reject the
+    # undone GDN state is re-derived by re-processing the undone position
+    # as row 0 of the next verify (1 leading row; 2+ only if several
+    # consecutive rejects stack — impossible at depth 1, kept general).
+    spec_undone: int = 0
+    # Spec resolve staging (set by the engine's _build_spec_output, before
+    # the drain): the resolved next input token; whether this iteration
+    # accepted (the drain emits the bonus only on accept).
+    spec_next_input: int | None = None
+    spec_accepted: bool = False
+    # Mapped-but-uncommitted page count: pages allocate_paged mapped for the
+    # in-flight verify rows that the resolve has NOT yet committed (accept
+    # commits both, reject frees row B's and reconciles to 0). Nonzero ONLY
+    # while a spec iteration is between _prepare_spec_batch and
+    # _rollback_spec_rejects — i.e. an abort/finish landing inside that
+    # window. Plain decode NEVER has one: its device_len = cached_len + 1
+    # is the pending-token slot whose table row is stale, not an allocation
+    # (freeing it double-frees a live page — the 8195 != 8194 integrity
+    # crash). _free_req_resources frees exactly this many tail pages.
+    spec_mapped_tail: int = 0
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -153,6 +182,29 @@ class Batch:
     @property
     def is_decode(self) -> bool:
         return self.phase == "decode"
+
+    # --- MTP spec verify batches (wave 2): staging for _forward_spec_batch. ---
+    # The scheduler builds the per-row trunk verify batches (row A = the
+    # certain/undone token, row B = the draft), stages the draft tokens
+    # and carries, plus the MTP replay's input/position/out-loc tensors.
+    # None on every non-spec batch.
+    spec_row_batches: "List[Batch] | None" = None
+    spec_carry_gpu: "torch.Tensor | None" = None      # [B, H] GPU
+    spec_input_tokens_gpu: "torch.Tensor | None" = None  # [B] int32 GPU (row A tokens)
+    spec_replay_input_ids: "torch.Tensor | None" = None
+    spec_replay_positions: "torch.Tensor | None" = None
+    spec_replay_out_loc: "torch.Tensor | None" = None
+    spec_replay_attn_metadata: "BaseAttnMetadata | None" = None
+    spec_next_input_gpu: "torch.Tensor | None" = None
+    # The MTP spec GDN-state snapshot per request: [B] pool slots holding
+    # the state AFTER verify row A (position q) — captured by the engine
+    # BETWEEN the row-A and row-B forwards (plan option (b): two
+    # sequential 1-row steps with a mid-snapshot; the state after row A is
+    # exactly what a reject's committed frontier [0, q+1) needs — the old
+    # pre-verify snapshot was one row stale vs cached_len and corrupted
+    # attention state under rejects). The scheduler stages each hybrid
+    # req's idle ping-pong slot; None for non-hybrid.
+    spec_gdn_snapshot_slots: "List[int] | None" = None
 
     @property
     def size(self) -> int:

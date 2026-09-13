@@ -165,8 +165,23 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
             )
         else:
-            mixed = self._conv_prefill(
-                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+            # Conv dispatch: a 1-token-per-req extend (the spec loop's
+            # verify rows) must use the DECODE conv kernel — the varlen
+            # conv kernels (fused sgl + triton fallback) leave the conv
+            # state UN-SHIFTED for a sequence shorter than the conv window
+            # with has_initial_state (their tail write skips/under-shifts
+            # when state_len > seqlen), so the window never advances and
+            # the trunk re-predicts stale tokens (the repetition
+            # attractor). The decode kernel's shift-append is correct for
+            # exactly this case (proven in
+            # tests/kernels/test_gdn_path_equivalence.py).
+            if (fla.has_initial_state is not None
+                    and (fla.cu_seqlens[1:] - fla.cu_seqlens[:-1] == 1).all()):
+                mixed = self._conv_decode(conv_in, fla.cache_indices, pool)
+            else:
+                mixed = self._conv_prefill(
+                    conv_in, pool, fla.cu_seqlens, fla.cache_indices,
+                    fla.has_initial_state)
             # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)

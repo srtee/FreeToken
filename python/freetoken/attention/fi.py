@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Dict, List, Literal
@@ -217,6 +218,11 @@ class FlashInferBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
         self._initialize_metadata_once(metadata)
+        if os.environ.get("FT_DEBUG_STORE"):
+            import sys
+            print(f"[store] layer={layer_id} k={tuple(k.shape)} v={tuple(v.shape)} "
+                  f"out_loc={tuple(batch.out_loc.shape)} dtype={batch.out_loc.dtype}",
+                  file=sys.stderr)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         pool = self.kvcache
         if getattr(pool, "is_turbo", False):

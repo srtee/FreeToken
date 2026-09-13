@@ -16,6 +16,10 @@ class SchedulerStatusReporter:
     _last_decode_time: float = field(init=False)
     _decode_forward_count: int = field(default=0, init=False)
     _decode_generated_tokens: int = field(default=0, init=False)
+    # MTP spec window counters (reset at each decode log tick): drafted =
+    # draft tokens offered this window, accepted = verified accepts.
+    _spec_drafted: int = field(default=0, init=False)
+    _spec_accepted: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         now = self.clock()
@@ -56,6 +60,17 @@ class SchedulerStatusReporter:
                 mamba_slots=mamba_slots,
                 swa_tokens=swa_tokens,
             )
+
+    def report_spec_window(self, drafted: int, accepted: int) -> None:
+        """Accumulate MTP spec telemetry (called per spec decode batch)."""
+        self._spec_drafted += drafted
+        self._spec_accepted += accepted
+
+    def count_generated_tokens(self, n: int) -> None:
+        """Drain-side correction: count the ACTUAL emitted tokens for this
+        batch's throughput window (spec batches emit up to 2/req)."""
+        self._decode_generated_tokens += n
+
 
     def _report_prefill(
         self,
@@ -103,6 +118,8 @@ class SchedulerStatusReporter:
         swa_tokens: tuple[int, int] | None = None,
     ) -> None:
         self._decode_forward_count += 1
+        # Default 1 token/req; the drain corrects upward per req via
+        # count_generated_tokens for spec batches' bonus emissions.
         self._decode_generated_tokens += len(batch.reqs)
         if self._decode_forward_count % self.decode_log_interval != 0:
             return
@@ -112,6 +129,15 @@ class SchedulerStatusReporter:
         self._last_decode_time = now
         gen_throughput = self._decode_generated_tokens / gap if gap > 0 else 0.0
         self._decode_generated_tokens = 0
+        spec_msg = ""
+        if self._spec_drafted > 0:
+            rate = self._spec_accepted / self._spec_drafted
+            spec_msg = (
+                f"#drafted: {self._spec_drafted}, "
+                f"#accepted: {self._spec_accepted} (rate {rate:.2f}), "
+            )
+            self._spec_drafted = 0
+            self._spec_accepted = 0
         self.log(
             f"Decode batch, "
             f"#running-req: {running_reqs}, "
@@ -120,6 +146,7 @@ class SchedulerStatusReporter:
             f"{_swa_msg(swa_tokens)}"
             f"{_mamba_msg(mamba_slots)}"
             f"gen throughput (token/s): {gen_throughput:.2f}, "
+            f"{spec_msg}"
             f"#queue-req: {queue_reqs}"
         )
 
