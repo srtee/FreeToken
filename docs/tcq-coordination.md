@@ -563,3 +563,20 @@ property (greedy argmax comparison at the same position) is already
 established by construction + the verify_chain unit tests. Recommended
 order: wave 2 graph machinery for draft+verify FIRST, then the verify
 batch surgery lands directly into the fast path.
+
+## MTP wave-1 economics CORRECTION (2026-09-13)
+
+The note below ("speedup = (1+acc)/2 ≤ 1.0 eager") and the parked wave-1
+verify design it describes were WRONG. The parked loop ran fwd1 (1-row)
+then a 2-row verify whose row A re-processed fwd1's output — three
+trunk rows per iteration for ≤2 emitted tokens: one forward structurally
+wasted, and the accounting undercounted emissions.
+
+The correct loop (standard Leviathan/DeepSeek formulation): the verify
+forward IS the next-token producer. Per iteration: draft (1 token) +
+ONE 2-row trunk forward [certain@q, draft@q+1]; row A's argmax verifies
+the draft, row B's argmax is the bonus; accept emits [d, b], reject
+emits [a] and rolls back row B. Tokens per iteration = 1 + accepted
+over c2 + cd forward-units → eager ceiling ≈ (1+r)/(c2+cd) ≈ 1.2–1.4×
+at r=0.7 (c2 measured in Stage 0). Wave 2 proceeds under
+docs/mtp-wave2-plan.md.

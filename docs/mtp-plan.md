@@ -179,9 +179,13 @@ accounts multiple tokens per step; `DecodeManager.inflight_tokens` already uses
 
 # Wave 2 — CUDA graphs for draft + verify
 
-**Goal**: make spec decoding actually fast. The draft forward is a bs×1 decode
-step of one transformer layer — graph it. The verify forward is a bs×(n+1)
-decode — it fits the existing decode graph machinery with a length parameter.
+**Status: SUPERSEDED by docs/mtp-wave2-plan.md (2026-09-13).** Wave-1's
+parked verify design (below in 1.3) ran one structurally wasted forward
+per iteration; the corrected loop, stage breakdown, and gates live in
+the wave-2 plan. The economics correction: the verify forward IS the
+next-token producer (one 2-row forward per iteration, not
+fwd1 + a separate 2-row verify); eager ceiling ≈ (1+r)/(c2+cd), not
+"≤ 1.0". This section is kept for history.
 
 ## Tasks
 

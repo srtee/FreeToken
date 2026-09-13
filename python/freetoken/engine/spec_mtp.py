@@ -54,15 +54,6 @@ def verify_chain(target_argmaxes: torch.Tensor,
     # a later draft is only valid if every earlier one was accepted
     return accepted.cumprod(dim=1, dtype=torch.int32)
 
-
-@dataclass
-class SpecStats:
-    """Drafted/accepted counters for the decode log line
-    (#drafted: N, #accepted: k (rate r))."""
-    drafted: int = 0
-    accepted: int = 0
-
-
 class MTPDrafter:
     """Runs the MTP draft step after the target decode step. The verify
     forward + req bookkeeping live in the scheduler hook (the verify batch
