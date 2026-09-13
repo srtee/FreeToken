@@ -282,6 +282,12 @@ class ModelConfig:
     lm_head_quant: str = "none"
     shared_expert_intermediate_size: int = 0
     use_qk_norm: bool = False
+    # MTP speculative-decoding draft head (Qwen3.5/3.6 nextn): 0 = absent.
+    # mtp_use_dedicated_embeddings False means the draft shares the trunk's
+    # embedding table and lm_head by reference (checkpoint carries no MTP
+    # embedding/head tensors).
+    mtp_num_hidden_layers: int = 0
+    mtp_use_dedicated_embeddings: bool = False
     # ----- DeepSeek/GLM-style MoE extensions (default keeps other models intact) -----
     # The first ``first_k_dense_replace`` decoder layers use a dense MLP instead of the
     # sparse MoE block (GLM-4: 3). Experts (and the offload cache) therefore only exist

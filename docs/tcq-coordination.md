@@ -477,3 +477,40 @@ Triton gotchas hit (for future kernels in this tree): tl tensor has no
 loop-carried `x: tl.constexpr` reassignment rejected (unroll); reshape
 dims must be plain constexpr ints (no tl tensors, no sentinels); tl.split
 splits the LAST axis (trans before/after to reach the pair axis).
+
+## MTP Wave 0 (2026-09-13): draft-head weights + module landed
+
+- 35B test vehicle: nvidia/Qwen3.6-35B-A3B-NVFP4 (HF dir, 22G, on disk).
+  The knoopx GGUF has NO MTP tensors (40 trunk blocks only) — the HF
+  checkpoint carries all 19 mtp.* tensors (verified), ALL bf16 including
+  the fused experts [256, ...] (the plan's NVFP4-expert concern doesn't
+  apply). HF dir serves coherently via the qwen3_5_moe family (ground
+  truths reproduced in 1.8s cold).
+- weight.py: mtp.* routing in _iter_weights_attn_fp8 — 1:1 remap
+  (mtp.layers.0.* -> model.mtp.layer.*, experts fused names kept), Gemma
+  (1+w) bake on all mtp norms, .weight suffix dropped (BaseOP tensor-attr
+  convention).
+- mtp.py: MTPHead/MTPDraftLayer/MTPAttention/MTPMoE as BaseOPs — eager
+  fp32 draft math (1 token/step; bf16 accumulation error compounds
+  through the verify loop), per-head q|gate split, partial NeoX rope
+  (rotary_dim 64 of 256), GQA against 2 kv heads, top-8 renormalized
+  router + gated shared expert.
+- config.py: mtp_num_hidden_layers / mtp_use_dedicated_embeddings
+  surfaced.
+- tests/models/test_mtp_load.py: 19-tensor routing, config surface,
+  state-dict key/shape equality, one-step forward. 4/4 green; the 2-3
+  tests/models failures (qwen4_exp AOT, muse_glimmer disk quota) are
+  pre-existing (fail on the clean tree too).
+- scripts/mtp_oracle.py: independent torch re-derivation of buun's
+  graph_mtp. CAVEAT: the composite carry-vs-reference comparison is
+  unstable (cos 0.5-1.0 across runs) — every STAGE matches piecewise
+  (attn 1.0, MoE 1.0, norms 1.0) but the composite is sensitive to
+  something unresolved (suspect router topk tie-breaking interacting
+  with the renormalized mixture). The AUTHORITATIVE numerical gate is
+  wave 1's ft-vs-llama.cpp hidden-state cross-check on identical token
+  prefixes (the method that root-caused the GDN bug). Wave 0 gates:
+  determinism, finite outputs, weight routing, config surface.
+- Delegation note: the local coder (32B turbo8) couldn't take the task —
+  omp -p injects a ~20k-token system prompt vs the coder's 12k KV cap
+  (VRAM-bound; 16k+ OOMs). Raised KV to 12288 tokens + fixed the omp
+  provider baseUrl (1918 -> 1919) and registry entry.

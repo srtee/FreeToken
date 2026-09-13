@@ -247,6 +247,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
         norm_topk_prob=True,
         moe_enabled=moe_enabled,
         use_qk_norm=True,
+        mtp_num_hidden_layers=getattr(text, "mtp_num_hidden_layers", 0) or 0,
+        mtp_use_dedicated_embeddings=bool(
+            getattr(text, "mtp_use_dedicated_embeddings", False)),
+
         model_type=getattr(hf_config, "model_type", "qwen3_5_moe"),
         architectures=getattr(hf_config, "architectures", ["Qwen3_5MoeForConditionalGeneration"]),
         vision_config=None,  # text-only milestone

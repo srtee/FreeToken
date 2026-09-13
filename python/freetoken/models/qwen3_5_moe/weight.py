@@ -150,6 +150,15 @@ def _is_gemma_norm(name: str) -> bool:
     return name == "model.norm.weight" or name.endswith(_GEMMA_NORM_SUFFIXES)
 
 
+def _is_mtp_gemma_norm(name: str) -> bool:
+    """MTP draft-head norms are the same Gemma (1+w) RMSNorm as the trunk
+    (HF qwen3_5_moe applies (1 + weight) uniformly; buun's nextn enorm/hnorm/
+    attn/post/norm all go through the arch's RMS builder)."""
+    return name.startswith("model.mtp.") and name.endswith(".weight") and (
+        "norm" in name.rsplit(".", 2)[0]
+    )
+
+
 def _try_fuse(
     name: str, tensor: torch.Tensor, buf: dict[str, dict[int, torch.Tensor]]
 ) -> tuple[str, torch.Tensor] | tuple[()] | None:
@@ -460,6 +469,32 @@ def _iter_weights_attn_fp8(
                     continue  # routed experts -> offload cache
                 if raw_name.endswith(_SCALE_SUFFIXES):
                     continue  # scales consumed with their .weight
+
+                if raw_name.startswith("mtp."):
+                    # MTP draft head (mtp-plan 0.1): plain bf16, 1:1 remap to
+                    # the MTPHead module attrs (BaseOP state_dict walks plain
+                    # tensor attributes, so names drop the trailing ".weight"):
+                    #   mtp.fc.weight                    -> model.mtp.fc
+                    #   mtp.norm.weight                  -> model.mtp.norm
+                    #   mtp.pre_fc_norm_X.weight         -> model.mtp.pre_fc_norm_X
+                    #   mtp.layers.0.<rest>.weight       -> model.mtp.layer.<rest>
+                    #   mtp.layers.0.mlp.experts.<p>     -> model.mtp.layer.mlp.experts_<p>
+                    #      (fused stacked experts; the eager MTPMoE consumes [E, ...])
+                    #   mtp.layers.0.mlp.shared_expert.<p>.weight
+                    #                                    -> model.mtp.layer.mlp.shared_expert_<p>
+                    # All mtp norms are Gemma (1 + weight) — baked here.
+                    tensor = f.get_tensor(raw_name)
+                    name = raw_name[len("mtp."):]
+                    if name.startswith("layers.0."):
+                        name = "layer." + name[len("layers.0."):]
+                    name = name.replace(".mlp.experts.", ".mlp.experts_")
+                    name = name.replace(".mlp.shared_expert.", ".mlp.shared_expert_")
+                    if name.endswith(".weight"):
+                        name = name[: -len(".weight")]
+                    if "norm" in name:
+                        tensor = tensor + 1.0  # Gemma (1 + weight)
+                    yield "model.mtp." + name, tensor
+                    continue
 
                 name = _rename(raw_name)
                 if name is None:
