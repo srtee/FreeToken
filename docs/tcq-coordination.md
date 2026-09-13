@@ -543,3 +543,23 @@ the decode loop). Verify batch design settled: 2 rows/req
 ([t_next, d]), accept iff row-A argmax == d, rollback row-B KV +
 device_len on reject; losslessness by construction (greedy argmax
 comparison at the same position).
+
+## MTP wave-1 economics (quantified, 2026-09-13)
+
+Eager depth-1 MTP cannot beat the baseline — by token accounting, not
+implementation quality:
+- spec iteration: fwd1 (1 row) + draft + fwd2 (2 rows) ≈ 2 forward-units
+- accept: emits d + b (2 tokens) → 1 token/forward-unit
+- reject: emits a (1 token) → 0.5 tokens/forward-unit
+- baseline: 1 forward-unit per token
+- speedup = (1 + accept_rate) / 2 ≤ 1.0 eager; 1.5x requires the verify
+  rows to cost ~1.3x a single decode (wave 2: graph the draft + verify,
+  or fold the verify rows into fwd1's batch).
+
+Consequence for sequencing: the verify-batch surgery (parked) is worth
+doing ONLY together with wave 2's graph work — building it eager-first
+buys a correctness proof but zero throughput, and the correctness
+property (greedy argmax comparison at the same position) is already
+established by construction + the verify_chain unit tests. Recommended
+order: wave 2 graph machinery for draft+verify FIRST, then the verify
+batch surgery lands directly into the fast path.
