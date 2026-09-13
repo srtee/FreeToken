@@ -248,3 +248,32 @@ Equivalences checked against buun:
    argmax-equality — the lossless formulation FreeToken uses
    (`verify_chain`). If non-greedy sampling is ever added, the acceptance
    rule changes; out of scope for wave 2 (greedy).
+---
+
+## Stage 0.3 — row-cost bench (2026-09-13, measured on the 35B)
+
+Setup: Qwen3.6-35B-A3B-NVFP4, `--moe-strategy offload`, triton backend,
+graphs off, 8192 pages, greedy, ~150-token prompts, 256-token generations,
+3-run means, expert cache warmed.
+
+- **c1 (1-row decode unit)**: 78.2 tok/s at bs=1 → 12.8 ms/step.
+- **c2 (2-row forward / verify shape)**: bs=2 concurrent decode sustained
+  156.4 tok/s aggregate — **2 rows cost the same wall time as 1 row**
+  (c2 ≈ 1.00). The 35B decode is expert-fetch bound (MoE offload), so
+  the second row rides free PCIe/CPU cycles already paid by the first.
+- **cd (draft step)**: not directly measurable outside the engine
+  (wave-1 MTPHead needs engine context); analytic bound: lm_head GEMV
+  [152k × 2048] bf16 ≈ 0.6 GB → ~1.2 ms + 1-layer attn/MoE/fc ≈ 2–4 ms
+  total ≈ **0.15–0.3 c1 units**.
+
+**Ceiling math (depth 1, eager)**: speedup = (1 + r) / (c2 + cd) with
+c2 = 1.0: at r = 0.7 → **1.52×**; at r = 0.55 → **1.39×**; even
+r = 0.3 → 1.15×. **GO**: on this hardware the depth-1 eager loop is
+already clearly profitable; graphs (Stages 2–3) mostly shave launch
+overhead and make the draft step cheaper.
+
+Bench caveats: bs=2 concurrency approximates a 2-row single-req verify
+(same row count per forward, same expert-fetch pattern; per-req
+attention shapes differ slightly — the verify attends over the req's
+own KV twice rather than two reqs' KV once each). Stage 1's E2E
+acceptance telemetry gives the exact realized numbers.
