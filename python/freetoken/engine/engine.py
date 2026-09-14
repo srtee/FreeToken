@@ -439,8 +439,8 @@ class Engine:
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            # MTP spec decoding runs the draft/verify eagerly; wave 2
-            # restores capture for the draft+verify graphs.
+            # Trunk graphs stay disabled under --spec-mtp (stage 2 captures
+            # only the draft family; stage 3 restores the verify).
             cuda_graph_bs=(None if config.spec_mtp else config.cuda_graph_bs),
             cuda_graph_max_bs=(0 if config.spec_mtp else config.cuda_graph_max_bs),
             free_memory=init_free_memory,
@@ -449,6 +449,28 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+        # The MTP draft family captures AFTER the trunk runner (which is a
+        # no-op under --spec-mtp) so the draft's prepare_for_capture owns
+        # the FI backend's capture scratch. FT_SPEC_DRAFT_EAGER=1 skips
+        # capture entirely: the eager draft path stays the bit-equality
+        # oracle and the debugging escape hatch.
+        self.draft_graph_runner = None
+        if config.spec_mtp and os.environ.get("FT_SPEC_DRAFT_EAGER") != "1":
+            from .graph import MTPDraftGraphRunner
+
+            self.draft_graph_runner = MTPDraftGraphRunner(
+                stream=self.stream,
+                device=self.device,
+                mtp=self.model.model.mtp,
+                attn_backend=self.attn_backend,
+                max_running_req=config.max_running_req,
+                cuda_graph_max_bs=config.cuda_graph_max_bs,
+                max_seq_len=aligned_max_seq_len,
+                vocab_size=config.model_config.vocab_size,
+                hidden_size=config.model_config.hidden_size,
+                dtype=config.dtype,
+                dummy_req=self.dummy_req,
+            )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
@@ -884,6 +906,11 @@ class Engine:
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
         self.attn_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
+        if self.draft_graph_runner is not None:
+            # The draft family's graphs bind the old pools' addresses too;
+            # drop it with the trunk family (recaptured below against the
+            # new tensors).
+            self.draft_graph_runner.destroy_cuda_graphs()
         # 2. Resize caches in place (each frees its old GPU tensors before allocating).
         # Pin the new window first (validated above) so any KV-pool rebuild below sizes the window
         # to it (_dsv4_pool_sizes / _swa_paged_num_tokens read config.swa_num_pages_override).
@@ -927,6 +954,23 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+        # Re-capture the draft family against the new tensors too.
+        if self.draft_graph_runner is not None:
+            from .graph import MTPDraftGraphRunner
+
+            self.draft_graph_runner = MTPDraftGraphRunner(
+                stream=self.stream,
+                device=self.device,
+                mtp=self.model.model.mtp,
+                attn_backend=self.attn_backend,
+                max_running_req=config.max_running_req,
+                cuda_graph_max_bs=config.cuda_graph_max_bs,
+                max_seq_len=aligned_max_seq_len,
+                vocab_size=config.model_config.vocab_size,
+                hidden_size=config.model_config.hidden_size,
+                dtype=config.dtype,
+                dummy_req=self.dummy_req,
+            )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
@@ -1251,6 +1295,8 @@ class Engine:
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
+        if self.draft_graph_runner is not None:
+            self.draft_graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 

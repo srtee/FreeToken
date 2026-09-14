@@ -171,14 +171,24 @@ def commit_reqs(reqs, result: SpecResult) -> None:
             f"spec loop invariant violated: last emitted token "
             f"{req.input_ids[-1].item()} != next input {next_input[i]}")
 
-class SpecStep:
-    """The eager spec loop owner: draft -> verify (2-row trunk forward)
-    -> resolve -> rollback, on the engine stream, inside forward_batch.
+class MTPDrafter:
+    """The MTP draft step's engine-side owner: stats + the batched eager
+    draft call. Built once at engine init under --spec-mtp.
 
-    Built once at engine init (like MTPDrafter); forward_batch calls
-    run() when the spec arm fires. Pure bookkeeping lives in the module
-    functions above (CPU-testable); the GPU-adjacent steps (the 2-row
-    batch build, the trunk forward, the MTP replay) live here.
+    History: this class was defined twice back-to-back (the wave-1
+    integration left both a SpecStep-shaped and a MTPDrafter-shaped copy
+    behind); consolidated 2026-09-14. The two ``draft`` methods were
+    byte-equivalent modulo parameter names -- (carry, tokens) vs
+    (hidden, next_tokens) -- and NEITHER has a production call site: the
+    scheduler's spec loop calls ``mtp.draft_step`` directly
+    (scheduler.py _prepare_spec_batch), the engine's resolve uses the
+    drafter for stats only, and stage 2's graph replay bypasses the eager
+    path entirely. ``draft`` stays as the eager reference the stage-2
+    bit-equality gate exercises.
+
+    The verify forward + req bookkeeping live in the scheduler hook (the
+    verify batch clones the decode batch's page allocation); the loop's
+    pure resolve logic is the module functions above.
     """
 
     def __init__(self, engine):
@@ -188,26 +198,9 @@ class SpecStep:
         self.stats = SpecStats()
 
     def draft(self, carry: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
-        """Batched 1-row MTP draft: [B, H] carry + [B] tokens -> [B] drafts."""
+        """One batched draft step: [B, H] carries (the trunk's post-norm
+        hidden at the just-sampled position) + [B] sampled tokens -> [B]
+        drafted tokens. The draft layer's KV row is written through the
+        trunk attention (layer_id = num_layers)."""
         _, logits = self.mtp.draft_step(carry, tokens)
-        return logits.argmax(dim=-1).to(torch.int32)
-
-
-class MTPDrafter:
-    """Runs the MTP draft step after the target decode step. The verify
-    forward + req bookkeeping live in the scheduler hook (the verify batch
-    clones the decode batch's page allocation)."""
-
-    def __init__(self, engine):
-        self.engine = engine
-        self.mtp = engine.model.model.mtp
-        assert self.mtp is not None, "--spec-mtp requires an MTP-capable checkpoint"
-        self.stats = SpecStats()
-
-    def draft(self, hidden: torch.Tensor, next_tokens: torch.Tensor) -> torch.Tensor:
-        """One draft step for the whole batch: carry = the trunk's post-norm
-        hidden at the just-sampled position, token = the sampled next token.
-        Returns the drafted token per request [B]. The MTP layer's KV row
-        is written through the trunk attention (layer_id = num_layers)."""
-        carry, logits = self.mtp.draft_step(hidden, next_tokens)
         return logits.argmax(dim=-1).to(torch.int32)

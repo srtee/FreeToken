@@ -139,7 +139,12 @@ class EngineConfig:
 
     @property
     def distributed_addr(self) -> str:
-        return "tcp://127.0.0.1:2333"
+        # Fixed default; FT_DIST_PORT lets concurrent single-rank processes
+        # (offline gates/harnesses) avoid rendezvous-port collisions without
+        # touching the shared default.
+        import os
+
+        return f"tcp://127.0.0.1:{os.environ.get('FT_DIST_PORT', '2333')}"
 
 
 def checkpoint_quant_config(model_path: str, hf_config: Any, spec: Any):

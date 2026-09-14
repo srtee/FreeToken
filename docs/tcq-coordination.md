@@ -598,3 +598,20 @@ docs/mtp-wave2-plan.md.
   send explicit temperature=0/top_k=1/top_p=1 (the is_greedy gate).
   systemd-oomd kills long serial expert-bank loads under user memory
   pressure; use --expert-load parallel.
+
+## 2026-09-14 — Wave 2 Stage 2: draft graph gate PASSED
+- Gate 1 (bit-equality, 200 steps bs 1..4, eager-vs-graphed argmax +
+  carry' + layer-40 KV rows): PASSED on server config.
+- Gate 2 (losslessness, in-process bs=1, 3 prompts, explicit greedy):
+  spec == plain byte-for-byte for every emitted token; spec run ends
+  1 token earlier at the max_tokens cap (accept emits 2 tokens per
+  iteration; benign boundary accounting, content identical).
+- Known-fake divergences documented: cuBLASLt bf16 GEMM kernel choice
+  is M-dependent — eager oracle for a padded-bs graph comparison must
+  pad to the same family bs before comparing [:bs].
+- One crash ticket left OPEN against Stage 1: GDN conv CUDA illegal
+  access in _forward_spec_batch under tight KV (kv_reserve 2048 /
+  max_seq 1024 harness); not hit on server config. Repro transcript in
+  Stage-2 probe logs.
+- Stage-2 diff (graph.py MTPDraftGraphRunner + engine/scheduler wiring
+  + test_draft_graph.py, CPU tests 9 passed) reviewed and green.

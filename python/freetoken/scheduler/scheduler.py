@@ -349,6 +349,10 @@ class Scheduler(SchedulerIOMixin):
                 # report_batch counted the default 1/req; count the spec
                 # bonus emission(s) on top for an exact throughput window.
                 self.status_reporter.count_generated_tokens(len(emitted) - 1)
+                if os.environ.get("FT_DEBUG_STORE"):
+                    import sys as _sys
+                    print(f"[drain] uid={req.uid} emitted={[int(t.item()) for t in emitted]}",
+                          file=_sys.stderr)
                 finished = False
                 for tok in emitted:
                     if spec_extra_cpu is None:
@@ -1139,10 +1143,23 @@ class Scheduler(SchedulerIOMixin):
         mtp = eng.model.model.mtp
         draft_batch = self._make_spec_row_batch(batch.reqs, is_row_a=True)
         draft_batch.input_ids = input_tokens
-        with torch.cuda.stream(eng.stream):
-            with eng.ctx.forward_batch(draft_batch):
-                drafts = mtp.draft_step(
-                    carries, input_tokens)[1].argmax(dim=-1).to(torch.int32)
+        # Wave-2 stage 2: the draft rides the per-bs CUDA-graph family when
+        # the engine captured it; eager stays the reference oracle
+        # (FT_SPEC_DRAFT_EAGER keeps the runner None) and the fallback for
+        # a bs over the family. draft_batch construction stays BEFORE the
+        # call either way: it supplies the positions/out_loc/metadata the
+        # captured attention needs on replay. The host-buf write ordering
+        # below (drafts -> req.input_ids[q+1] before the row batches are
+        # built) is unchanged in both arms.
+        runner = getattr(eng, "draft_graph_runner", None)
+        if runner is not None and runner.can_draft(batch.size):
+            with torch.cuda.stream(eng.stream):
+                drafts, _carry_out = runner.draft(carries, input_tokens, draft_batch)
+        else:
+            with torch.cuda.stream(eng.stream):
+                with eng.ctx.forward_batch(draft_batch):
+                    drafts = mtp.draft_step(
+                        carries, input_tokens)[1].argmax(dim=-1).to(torch.int32)
         for req, d in zip(batch.reqs, drafts.tolist()):
             req.spec_draft = int(d)
             # BUG-3 fix: the draft's host-buf slot. The verify's row B
