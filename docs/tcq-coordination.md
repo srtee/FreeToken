@@ -615,3 +615,21 @@ docs/mtp-wave2-plan.md.
   Stage-2 probe logs.
 - Stage-2 diff (graph.py MTPDraftGraphRunner + engine/scheduler wiring
   + test_draft_graph.py, CPU tests 9 passed) reviewed and green.
+
+## 2026-09-14 — GDN tight-KV crash ticket: CLOSED (not reproduced)
+
+- 45-min instrumented repro (scripts/repro_gdn_tightkv.py, monkeypatched
+  invariant monitors on Scheduler._forward_spec / Engine._forward_spec_batch):
+  380+ spec iterations at kv_reserve 2048 / max_seq 1024, prompts driven to
+  the 1024 cap — zero invariant violations, zero crashes.
+- The mid-run "page_table entry OOB" abort was a MONITOR bug: it bounded
+  KV slot ids by page_table.shape[0] (request-row count, 2) instead of the
+  pool size (~2049). Legit slots 961..1024 tripped it. Fixed in the monitor;
+  subsequent runs clean.
+- Hypotheses (a) snapshot-slot restore OOB and (c) SWA/page-slot collision:
+  exonerated. Hypothesis (b) (conv-window position OOB after device_len
+  rewinds): plausible but UNCONFIRMED — no assert fired for it. If the
+  illegal access re-fires on server config, re-arm the monitors from
+  scripts/repro_gdn_tightkv.py and drive >2K spec tokens.
+- Original crash context (Stage-2 gate harness, tight-KV config, ~5.5K spec
+  tokens): remains a one-off observation, not a confirmed defect.
