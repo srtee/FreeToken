@@ -580,3 +580,21 @@ emits [a] and rolls back row B. Tokens per iteration = 1 + accepted
 over c2 + cd forward-units → eager ceiling ≈ (1+r)/(c2+cd) ≈ 1.2–1.4×
 at r=0.7 (c2 measured in Stage 0). Wave 2 proceeds under
 docs/mtp-wave2-plan.md.
+
+## 2026-09-14 — Wave 2 Stage 1 gate PASSED (91dec7f)
+
+- Byte-identity: spec greedy bs=1 outputs byte-identical to plain decode
+  over 3 ground-truth prompts (1176 tokens).
+- Acceptance: depth-1 rate 0.58–0.65 (mean 0.63) on essay/code prompts —
+  in line with the Stage 0.3 oracle ceiling.
+- Throughput: spec 22.7 tok/s vs plain 34.3 tok/s at bs=1 (eager
+  sequential-rows design: 2 trunk forwards + MTP replay per iteration on
+  CUDA-graph-disabled decode). Stage 3 (fused 2-row verify graph) is the
+  intended fix; do NOT tune Stage 1 further.
+- Abort: client-disconnect mid-spec-generation tears down cleanly
+  (health ok, KV/mamba slots drain to 0, next request serves normally).
+- Operational notes: the model's HF generation defaults
+  (top_k=20, top_p=0.95) silently disarm the spec path — requests must
+  send explicit temperature=0/top_k=1/top_p=1 (the is_greedy gate).
+  systemd-oomd kills long serial expert-bank loads under user memory
+  pressure; use --expert-load parallel.
