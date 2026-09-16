@@ -305,7 +305,20 @@ class FlashInferBackend(BaseAttnBackend):
         from flashinfer import CUDAGraphBatchDecodeWithPagedKVCacheWrapper
 
         bs = batch.size
-        assert bs in self.capture_bs and bs not in self.graph_wrappers and self.capture
+        assert bs in self.capture_bs and self.capture
+        if bs in self.graph_wrappers:
+            # Re-capture of a second graph family at this bs (e.g. the MTP
+            # verify row after the draft step): REUSE the existing per-bs
+            # wrapper. The wrapper only binds static scratch buffers, and
+            # every replay re-plans (prepare_for_replay) before g.replay(),
+            # so the plan state is not shared state — sharing the wrapper
+            # is semantically identical to a fresh one.
+            self.prepare_metadata(batch)
+            metadata = batch.attn_metadata
+            assert isinstance(metadata, FIMetadata)
+            metadata.wrapper = self.graph_wrappers[bs]
+            self._initialize_metadata_once(metadata)
+            return
         capture = self.capture
         self.graph_wrappers[bs] = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
             self.float_workspace_buffer,

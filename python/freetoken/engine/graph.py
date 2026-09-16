@@ -475,3 +475,211 @@ class MTPDraftGraphRunner:
         self.graph_map = {}
         self.buffer = None
         gc.collect()
+
+
+@dataclass
+class MTPVerifyBuffer:
+    """Static I/O buffers of the captured verify-row forward (one family,
+    sized [max_bs, ...], sliced [:bs] per replay).
+
+    Both verify rows have IDENTICAL captured geometry (bs rows x 1 token,
+    decode phase) and differ only in staged buffer contents, so ONE buffer
+    + ONE graph per bs serves row A and row B. hidden_out is the captured
+    post-trunk hidden (the next row's B-input carry + the resolve's
+    carry); logits is fp32 (exact bf16 cast — the argmax comparisons are
+    bit-identical to the eager path's). No GDN snapshot state here: the
+    mid-verify snapshot stays a host-issued pool copy BETWEEN the two
+    replays (program order = stream order, the same invariant the eager
+    path relies on).
+    """
+    token_in: torch.Tensor    # [max_bs] int32 — row A: spec_next_input, row B: the draft
+    out_loc: torch.Tensor     # [max_bs] int32 — the row's KV write slot
+    positions: torch.Tensor   # [max_bs] int32
+    logits: torch.Tensor      # [max_bs, vocab] fp32
+    hidden_out: torch.Tensor  # [max_bs, H] model dtype — post-trunk last_hidden
+
+    @classmethod
+    def init(cls, max_bs: int, hidden_size: int, vocab_size: int,
+             dtype: torch.dtype, device: torch.device) -> MTPVerifyBuffer:
+        return cls(
+            token_in=torch.zeros(max_bs, dtype=torch.int32, device=device),
+            out_loc=torch.zeros(max_bs, dtype=torch.int32, device=device),
+            positions=torch.zeros(max_bs, dtype=torch.int32, device=device),
+            logits=torch.empty(max_bs, vocab_size, dtype=torch.float32, device=device),
+            hidden_out=torch.empty(max_bs, hidden_size, dtype=dtype, device=device),
+        )
+
+    def stage_inputs(self, tokens: torch.Tensor, out_loc: torch.Tensor,
+                     positions: torch.Tensor, bs: int) -> None:
+        """Copy one row's live inputs into the static slices [:bs]."""
+        self.token_in[:bs] = tokens
+        self.out_loc[:bs] = out_loc
+        self.positions[:bs] = positions
+
+
+class MTPVerifyGraphRunner:
+    """CUDA-graph family for the MTP verify trunk row (wave-2 stage 3).
+
+    One captured TRUNK forward per bs (the full decoder stack + lm_head +
+    last_hidden store), replayed twice per spec iteration: row A
+    (the certain token at position q) and row B (the draft at q+1). The
+    two rows have identical captured geometry (bs rows x 1 token, decode
+    phase) — only the staged buffers and the FI plan (host-side, outside
+    the graph) differ — so one graph per bs covers both rows.
+
+    Mirrors MTPDraftGraphRunner: EXACT-bs family (no padding; the verify
+    MoE's bf16 GEMM is M-shape-sensitive), warmup outside the graph, one
+    shared mempool, FI decode wrapper per bs via
+    attn_backend.prepare_for_capture; each replay re-plans the FI
+    metadata host-side (prepare_for_replay) BEFORE g.replay().
+
+    The mid-verify GDN snapshot (defect-2 fix) stays a host-issued
+    linear_state_pool copy issued BETWEEN the two replays — program order
+    on the engine stream puts it after row A's kernels and before row
+    B's, exactly matching the eager path. The GDN state pool slots are
+    keyed by linear_table_idx, which the captured GDN kernels read from
+    static buffers staged per replay (same mechanism as the draft's
+    out_loc).
+    """
+
+    def __init__(
+        self,
+        stream: torch.cuda.Stream,
+        device: torch.device,
+        model,  # Qwen3_5MoEForCausalLM (the TRUNK)
+        attn_backend: BaseAttnBackend,
+        max_running_req: int,
+        cuda_graph_max_bs: int | None,
+        max_seq_len: int,
+        vocab_size: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        dummy_req: Req,
+        moe_offload_cache: "OffloadMoeCache | None" = None,
+    ) -> None:
+        bs_list = _determine_draft_graph_bs(max_running_req, cuda_graph_max_bs)
+        self.attn_backend = attn_backend
+        self.max_graph_bs = max(bs_list) if bs_list else 0
+        self.graph_bs_list = sorted(bs_list)
+        self.stream = stream
+        self.device = device
+        self.model = model
+        self.dummy_req = dummy_req
+        self.moe_offload_cache = moe_offload_cache
+        self.table_bufs: Dict[int, torch.Tensor] = {}
+        self._capture_graphs(max_seq_len, vocab_size, hidden_size, dtype)
+
+    def _capture_graphs(self, max_seq_len: int, vocab_size: int,
+                        hidden_size: int, dtype: torch.dtype) -> None:
+        self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        if self.max_graph_bs == 0:
+            self.buffer = None
+            return logger.info_rank0("MTP verify CUDA graph is disabled.")
+        # The FI backend's capture state is ALREADY ARMED here: the trunk
+        # GraphRunner stays disabled under --spec-mtp and the DRAFT runner
+        # (constructed before this one — engine.py ordering contract) has
+        # called init_capture_graph and built its per-bs graph_wrappers.
+        # The verify runner reuses that same arm: prepare_for_capture below
+        # adds the verify's own wrappers (per-bs, keyed the same way) —
+        # both families' wrappers live in attn_backend.graph_wrappers
+        # until reset_capture tears them down together.
+        logger.info_rank0(f"Capturing MTP verify graphs with sizes: {self.graph_bs_list}")
+        self.buffer = MTPVerifyBuffer.init(
+            self.max_graph_bs, hidden_size, vocab_size, dtype, self.device)
+        self._dummy_out_loc = int(
+            get_global_ctx().page_table[self.dummy_req.table_idx, 0].item())
+        self.buffer.out_loc.fill_(self._dummy_out_loc)
+        # Persistent GDN cu_seqlens (one arange, sliced [:bs+1] per captured bs).
+        # The captured GDN kernels load bos/eos from this memory AT REPLAY, so it
+        # must have an owner that outlives the capture loop: the loop-local
+        # capture Batch (whose fla_metadata holds the tensor) is dropped at the
+        # next iteration, and a fresh per-bs arange here was freed and reused by
+        # replay-time eager temps — corrupting bos/eos/T inside every captured
+        # GDN kernel at bs>=2 (bs=1 stayed bit-equal only by allocator luck).
+        self.fla_cu_seqlens = torch.arange(
+            self.max_graph_bs + 1, dtype=torch.int32, device=self.device)
+        pool = None
+        for bs in sorted(self.graph_bs_list, reverse=True):
+            graph = torch.cuda.CUDAGraph()
+            batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
+            batch.padded_reqs = batch.reqs
+            self.attn_backend.prepare_for_capture(batch)
+            # GDN metadata against static buffers (stable addresses): the
+            # captured GDN kernels read cu_seqlens (constant arange) and
+            # cache_indices (this bs's persistent slot map) from HERE.
+            table_buf = torch.zeros(
+                max(self.graph_bs_list), dtype=torch.int32, device=self.device)
+            self.table_bufs[bs] = table_buf
+            if self.linear_state_pool() is not None:
+                from freetoken.attention.linear import FLAMetadata
+                batch.fla_metadata = FLAMetadata(
+                    cu_seqlens=self.fla_cu_seqlens[: bs + 1],
+                    cache_indices=table_buf[:bs],
+                )
+            batch.input_ids = self.buffer.token_in[:bs]
+            batch.out_loc = self.buffer.out_loc[:bs]
+            batch.positions = self.buffer.positions[:bs]
+            with get_global_ctx().forward_batch(batch):
+                warm_logits = self.model.forward()
+                self.buffer.logits[:bs] = warm_logits
+                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                    logits = self.model.forward()
+                    self.buffer.logits[:bs] = logits
+                    self.buffer.hidden_out[:bs] = self.model.last_hidden.to(dtype)
+                self._reset_moe_offload_cache()
+            if pool is None:
+                pool = graph.pool()  # one shared mempool across the family
+            self.graph_map[bs] = graph
+        self._reset_moe_offload_cache()
+
+    def _reset_moe_offload_cache(self) -> None:
+        if self.moe_offload_cache is not None:
+            self.moe_offload_cache.reset()
+
+    def linear_state_pool(self):
+        return getattr(get_global_ctx(), "linear_state_pool", None)
+
+    def can_verify(self, bs: int) -> bool:
+        """The scheduler's eager-fallback gate (mirror of can_draft)."""
+        return self.max_graph_bs > 0 and _draft_family_bs(self.graph_bs_list, bs) is not None
+
+    def verify_row(self, row_batch: Batch) -> tuple[torch.Tensor, torch.Tensor]:
+        """One replay: (tokens [bs] int32, out_loc [bs] int32, positions
+        [bs] int32, linear slots [bs] int32 staged from ``row_batch``) ->
+        (row_logits fp32 [bs, vocab], row_hidden [bs, H]).
+
+        ``row_batch`` is the scheduler's 1-row spec row batch
+        (_make_spec_row_batch): it supplies the req views whose
+        device_len/table_idx feed the FI plan and whose
+        positions/out_loc/linear_table_idx this method stages.
+        """
+        bs = row_batch.size
+        assert _draft_family_bs(self.graph_bs_list, bs) is not None, (
+            f"bs={bs} over the verify family {self.graph_bs_list}: "
+            "the scheduler must gate through can_verify() first")
+        assert self.buffer is not None and self.max_graph_bs > 0
+        g = self.graph_map[bs]
+        self.attn_backend.prepare_metadata(row_batch)
+        self.buffer.stage_inputs(
+            row_batch.input_ids, row_batch.out_loc, row_batch.positions, bs)
+        if self.linear_state_pool() is not None:
+            self.graph_map_table(row_batch, bs)
+        self.attn_backend.prepare_for_replay(row_batch)
+        g.replay()
+        return self.buffer.logits[:bs], self.buffer.hidden_out[:bs]
+
+    def graph_map_table(self, row_batch: Batch, bs: int) -> None:
+        """Stage the row's GDN slot ids into the captured cache_indices.
+        One persistent buffer per captured bs holds the row's
+        linear_table_idx; the FLAMetadata built at capture points HERE."""
+        slots = row_batch.linear_table_idx
+        assert slots is not None, "verify replay requires linear slots (hybrid GDN)"
+        buf = self.table_bufs[bs]
+        buf[:bs] = slots.to(torch.int32, non_blocking=True)
+
+    # NOTE: must run before freeing NCCL resources (same contract as the trunk).
+    def destroy_cuda_graphs(self) -> None:
+        self.graph_map = {}
+        self.buffer = None
+        self.fla_cu_seqlens = None
+        gc.collect()
