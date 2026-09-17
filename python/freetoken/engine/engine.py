@@ -303,7 +303,9 @@ class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
-        if not (config.spec_mtp and config.cuda_graph_max_bs > 0):
+        # None ("auto") resolves to max_running_req in _adjust_config whenever
+        # graphs stay enabled, so under spec only an explicit 0 disables capture.
+        if not (config.spec_mtp and config.cuda_graph_max_bs != 0):
             _ensure_expandable_segments()  # before the first CUDA allocation below
 
         from freetoken.gpu_select import bind_assigned_gpu
