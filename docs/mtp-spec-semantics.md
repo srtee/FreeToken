@@ -216,9 +216,12 @@ Equivalences checked against buun:
 - "first draft consumes prefill's last hidden" ⇔ `pending_h` refresh in
   `process()` (2934-2936) and `draft_carry` (64-67).
 
-## Open items for Stage 1
+## Former open items — wave-2 status
 
-1. **GDN reject-path mechanism** (plan already flags it): the 2-row
+1. ~~GDN reject-path mechanism~~ **RESOLVED (wave 2)**: GDN recurrent/conv
+   states are snapshotted and restored around the verify rows via the
+   linear-state pool (`copy_from` + track snapshots); a reject rewinds to
+   the snapshot frontier. Original analysis: the 2-row
    verify pollutes the trunk's GDN recurrent state at row B; buun solves
    it with a full sequence-image backup + restore + re-decode of accepted
    tokens (server-context.cpp:20069-20157) or a GPU tape replay (DFlash
@@ -226,18 +229,23 @@ Equivalences checked against buun:
    sequential 1-row GDN steps vs accept-path-only refresh) remain a
    Stage-1 decision by measurement — the semantics doc only pins the
    layer-40 (attention) side, which is trimmable in place.
-2. **Multi-request interleaving of process()**: buun's `process()` is
+2. ~~Multi-request interleaving of process()~~ **RESOLVED (wave 2)**: the
+   MTP replay lives in `Engine._forward_spec_batch` /
+   `_build_mtp_replay_batch` (engine.py); the scheduler supplies per-row
+   `spec_row_batches`. Original question: buun's `process()` is
    called on the whole target batch (server-context.cpp:19405-19407) and
    asserts contiguous per-seq row groups (speculative.cpp:2860-2863).
    FreeToken's equivalent must decide where the replay lives
    (`engine.forward_batch` vs scheduler hook) — semantics identical, the
    ownership is a code-layout question.
-3. **`p_min`-style confidence gating**: buun may stop drafting early on
+3. **`p_min`-style confidence gating** — STILL OPEN (future depth-2 work):
+   buun may stop drafting early on
    low draft confidence (speculative.cpp:3038-3043) and has adaptive
    depth capping (3116-3131). Depth-1 FreeToken starts without these;
    if added later they change only the draft side, not the semantics
    above.
-4. **Verify-batch abort**: what happens on abort between draft and
+4. ~~Verify-batch abort~~ **RESOLVED (stage-1 gate; drain verified in the
+   stage-1 soak)**: what happens on abort between draft and
    verify (plan's Stage-1 gate) has no buun analogue to copy directly —
    the invariant to maintain is "after any abort, layer-40 rows are
    dense up to the committed frontier and the carry matches the newest

@@ -1,10 +1,12 @@
 # MTP Wave 2 — Speculative decode in production (draft + verify, graphs)
 
-Status: plan (2026-09-13). Supersedes the Wave-2 section of `mtp-plan.md`
-(which is kept for history). Prerequisite state: waves 0 + 1 landed
-(`8da83f9`, `8203e81`) — MTP weights load, `MTPHead.draft_step` runs on
-the trunk attention (layer-40 KV), `--spec-mtp` plumbs through, graphs
-forced off for spec, `verify_chain` unit-tested.
+Status: **stages 1–3 LANDED** (stage-3 gate ALL PASS 2026-09-17, commits
+`22a83b8` + `f08f033`; outcome notes in `mtp-stage3-status.md`). Supersedes
+the Wave-2 section of `mtp-plan.md` (kept for history). Stage 4 (depth-2)
+and Stage 5 (soak + final docs) are the remaining open stages. Prerequisite
+state at planning time: waves 0 + 1 landed (`8da83f9`, `8203e81`) — MTP
+weights load, `MTPHead.draft_step` runs on the trunk attention (layer-40
+KV), `--spec-mtp` plumbs through, `verify_chain` unit-tested.
 
 ## The corrected loop (read first — wave-1's parked design was wrong)
 
@@ -162,9 +164,8 @@ depth-2 perf decision from measured numbers.
 ### Stage 5 — Hardening + docs
 
 30-min soak (spec on, 20 turns × 3 prompts, byte-stability per turn);
-`ft ctl stats` clean; docs: `cli.md` (--spec-mtp, --spec-draft-n),
-`models.md` (MTP section), this plan's status table,
-`tcq-coordination.md` entry; final numbers into
+`ft ctl stats` clean; docs: `cli.md` (`--spec-mtp`), `models.md` (MTP
+section), this plan's status table; final numbers into
 `docs/mtp-baseline-numbers.md`.
 
 ## Bug-catching doctrine (applies to every stage)
@@ -181,13 +182,3 @@ depth-2 perf decision from measured numbers.
 6. Acceptance-rate telemetry is a correctness signal too: the layer-40
    KV gap class of bugs is lossless-but-quality-destroying; the r ≥ 0.55
    gate catches what byte-identity cannot.
-
-## Delegation protocol
-
-One glm-5.3-flash implementer subagent per stage (sequential — each
-stage's gate must pass before the next dispatches). I review the full
-diff at every stage boundary before the next dispatch. The implementer
-brief always includes: this plan doc, the semantics doc (from Stage 0),
-the stage's contract + gate, and the file list. No project-wide commands
-by the subagent (I run the suite + serve smokes myself — GPU is single
-and contended).

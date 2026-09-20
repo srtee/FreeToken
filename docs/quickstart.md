@@ -12,6 +12,9 @@ ft serve --model ~/models/Qwen3.6-35B-A3B
 and MoE backends, cache sizes, tool-call and reasoning parsers — resolves from
 the checkpoint and the GPU; see [cli.md](cli.md) for the flags. The server is
 ready when the log reaches `API server is ready to serve on 127.0.0.1:1919`.
+MTP-capable checkpoints (Qwen3.5/3.6 with an `mtp.*` head) can add
+`--spec-mtp` for speculative decoding — depth-1 greedy draft + verify,
+both CUDA-graphed, greedy-lossless.
 
 ## Send a request
 

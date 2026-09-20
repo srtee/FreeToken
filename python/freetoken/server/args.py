@@ -429,8 +429,9 @@ def parse_args(
         action="store_true",
         default=ServerArgs.spec_mtp,
         help="MTP speculative decoding (Qwen3.5/3.6 checkpoints with an "
-        "mtp.* head): depth-1 greedy draft + verify. Eager — forces CUDA "
-        "graph exclusion. Lossless: greedy output is byte-identical.",
+        "mtp.* head): depth-1 greedy draft + verify, both CUDA-graphed "
+        "(trunk graphs are excluded instead). Lossless: greedy output is "
+        "byte-identical to plain decode.",
     )
     parser.add_argument(
         "--kv-codec-tune",

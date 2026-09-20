@@ -46,6 +46,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
+| `--spec-mtp` | off | MTP speculative decoding (Qwen3.5/3.6 checkpoints with an `mtp.*` head): depth-1 greedy draft + 2-row verify, both CUDA-graphed (trunk graphs are excluded instead). Lossless: greedy output is byte-identical to plain decode |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
 
 ### Choosing a GPU

@@ -4,17 +4,17 @@
 iterations, eager==graphed argmax/hidden/GDN snapshot, bs 1..4) + Gate 2 losslessness (3 prompts,
 763 tokens byte-identical at bs=1, cap-short spec lengths allowed). Log: `/tmp/stage3_gate6.log`.
 
-## State of the tree (uncommitted, on `gguf-serve` @ `7bab4f8`)
+## State of the tree (committed: `22a83b8` + `f08f033` on `gguf-serve`)
 
 | File | Change |
 |---|---|
-| `python/freetoken/engine/engine.py` | **ES fix v2 (never enable)**: `_ensure_expandable_segments` is **skipped entirely** when `spec_mtp && cuda_graph_max_bs > 0` (engine.py:306-307). The earlier capture-time flip (v1) was proven insufficient (M1/M2 probes still IMA at bs=2/4) — ES must be off from the FIRST allocation (KV pool, FI workspace, all pre-capture tensors) or mixed segment types corrupt replay. Restore hooks in rebuild/shutdown removed (nothing to restore). |
+| `python/freetoken/engine/engine.py` | **ES fix v2 (never enable)**: `_ensure_expandable_segments` is skipped when `spec_mtp && cuda_graph_max_bs != 0` (engine.py:306-309; `None` = auto counts as graph-enabled — `f08f033` fixed the server default tripping a `None > int` TypeError). The earlier capture-time flip (v1) was proven insufficient (M1/M2 probes still IMA at bs=2/4) — ES must be off from the FIRST allocation (KV pool, FI workspace, all pre-capture tensors) or mixed segment types corrupt replay. Restore hooks in rebuild/shutdown removed (nothing to restore). |
 | `python/freetoken/attention/fi.py` | **Wrapper reuse on re-capture**: `prepare_for_capture` no longer asserts `bs not in graph_wrappers`; a second graph family at the same bs (the verify family after the draft family) REUSES the existing per-bs FI wrapper (static scratch buffers, re-planned in place). Required for two families to coexist per bs; audited capture/replay clean. |
 | `scripts/mtp_stage3_probe.py` | Seqlen-sweep bit-equality probe. **2026-09-16 harness fix (final form `+bs`)**: graphed-arm `linear_table_idx` must be (a) DISJOINT from the eager arm's slots (else the graphed row inherits eager's advanced GDN state as its initial state — the entire bs=4 "failure"; `+3` overlapped at slot 4 iff bs=4) and (b) IN-BOUNDS of the `4·mr+1`-slot pool (`slots + out_off=100` IMA'd every leg instantly). `slots + (bs if out_off else 0)` satisfies both at every bs. |
 | `scripts/mtp_tail_probe.py` | Tail-op capture-vs-eager bisect (all ops exonerated). |
 | `scripts/mtp_stage3_replaydiff.py` | New (2026-09-16): checksum-diff of every capture-read buffer across `replay → eager → replay` at fixed bs; includes the zero-FI-workspace causal test. Proved replay determinism + exonerated the FI float workspace. |
-| `scripts/mtp_stage3_mini.py` | New mini-gate: fixed bs, 2 seqlens per row option, N steps — **run it next** (baseline run was killed at launch). |
-| `scripts/mtp_stage3_gate_worker.py` | GDN band staging fixed `slots+11` → `slots+5` (in-bounds). |
+| `scripts/mtp_stage3_mini.py` | Fixed-bs mini-gate used during diagnosis; superseded by the probe matrix + `mtp_stage3_gate.py`. |
+| `scripts/mtp_stage3_gate_worker.py` | The gate's one-pass worker (plain \| spec): generates the 3-prompt outputs byte-diffed by the gate; the spec worker also runs the in-process bit-equality loop. GDN band staging fixed `slots+11` → `slots+5` (in-bounds). |
 
 ## Established facts (evidence-backed)
 
@@ -32,7 +32,7 @@ iterations, eager==graphed argmax/hidden/GDN snapshot, bs 1..4) + Gate 2 lossles
    - The FI float workspace (`fi.float_ws`, aliased into `wrap4`) MOVES when eager runs interleave — exonerated: zeroing it before replays changed nothing; its contents are eager-side scratch, never a capture-read dependency. Same for moe bank caches / recurrent states movement (states advance in place by design).
    - The old "bs=4 failure" chain, fully decomposed: (a) real bug = freed capture-time `cu_seqlens` (fact 4, fixed); (b) bs=4-only signal = harness slot overlap at `+3` (fixed, `+bs`); (c) an intermediate harness iteration (`slots+100`) IMA'd — OOB vs the `4·mr+1` pool (gotcha below).
 
-## Next steps (in order, when resuming)
+## Resolution log
 
 1. ~~Mini-gate / layer bisect / GDN fix / probe matrix~~ **ALL DONE.** Root cause: freed capture-time `cu_seqlens` (fact 4, fixed in `_capture_graphs`). Probe matrix **GREEN** 2026-09-16 evening — bs=1/2/4 all `maxdiff=0` across the full seqlen sweep (fact 5, logs `/tmp/stage3_matrix_{4,2,1}.log`).
 2. ~~Full stage-3 gate~~ **Gate 1 PASSED. Gate 2 root cause: BATCH-SHAPE asymmetry between the
@@ -68,7 +68,7 @@ iterations, eager==graphed argmax/hidden/GDN snapshot, bs 1..4) + Gate 2 lossles
 - **Gate-2 byte-divergence (98/46/230 fingerprint) root cause: BATCH-SHAPE asymmetry between the
   gate's arms** — plain built `mr=1/cgmbs=1` (prompts queue, M=1 GEMMs), spec built `mr=4/cgmbs=4`
   (3 prompts batched, M=3 GEMMs). cuBLASLt bf16 kernel choice is M-dependent (the documented
-  known-fake, tcq-coordination 2026-09-14): different kernels differ by 1 ULP on some rows and
+  known-fake, measured 2026-09-14): different kernels differ by 1 ULP on some rows and
   greedy near-tie argmaxes flip at arbitrary positions. Every earlier falsification (allocator,
   MoE-cache pin, fully-eager) kept this asymmetry and reproduced the same fingerprint — and the
   stage-1-era tree reproduces it too, so it was NEVER a stage-2/3 regression. Fix: both arms
@@ -82,7 +82,7 @@ iterations, eager==graphed argmax/hidden/GDN snapshot, bs 1..4) + Gate 2 lossles
 
 - RAM: **123 GiB installed, swap empty** — expert banks now load at disk speed; each probe run is ~4 min instead of ~13.
 - Checkpoint: `~/.cache/huggingface/hub/models--nvidia--Qwen3.6-35B-A3B-NVFP4/snapshots/1355db6a052410cfd62085d94b58866fd0f2c3c5` (the knoopx GGUF snapshot is NOT the right one for these scripts).
-- Log artifacts: `/tmp/m1.log`, `/tmp/m2.log` (fix-v2 matrix, in flight), `/tmp/stage3_gate.log` (pre-fix run), `/tmp/stage3_gate2.log` (post-ES-flip-v1, still IMA), `/tmp/stage3_probe_sweep*.log` (passing seqlen sweeps), `/tmp/tail_probe.log` (tail-op exoneration).
+- Log artifacts: `/tmp/m1.log`, `/tmp/m2.log` (fix-v2 matrix), `/tmp/stage3_gate.log` (pre-fix run), `/tmp/stage3_gate2.log` (post-ES-flip-v1, still IMA), `/tmp/stage3_probe_sweep*.log` (passing seqlen sweeps), `/tmp/tail_probe.log` (tail-op exoneration).
 - `/tmp/stage3_gate3.log` (gate, pre-M-fix: fib[98] fingerprint), `/tmp/stage3_gate5.log` (pinned-cache
   still diverging → killed moe_cache theory), `/tmp/stage3_gate6.log` (**FINAL ALL PASS**), replaydiff
   chain `/tmp/replaydiff{3,4}.log`, probe matrices `/tmp/stage3_matrix_{4,2,1}.log`.
