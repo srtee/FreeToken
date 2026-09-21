@@ -39,6 +39,7 @@ def chunk_gated_delta_rule_fwd(
     initial_state_indices: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
+    track_pairs: Optional[torch.Tensor] = None,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -54,7 +55,7 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices,
     )
 
-    h, v_new = chunk_gated_delta_rule_fwd_h(
+    h, v_new, h_track = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
         u=u,
@@ -63,6 +64,7 @@ def chunk_gated_delta_rule_fwd(
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        track_pairs=track_pairs,
     )
     o = chunk_fwd_o(
         q=q,
@@ -74,9 +76,9 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
     )
     if SUPPRESS_LEVEL < 3:
-        return g, o, A, None, h, None
+        return g, o, A, None, h, h_track
     elif SUPPRESS_LEVEL >= 3:
-        return g, o, A, w, h, v_new
+        return g, o, A, w, h, h_track
 
 
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
@@ -96,6 +98,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         initial_state_indices: torch.Tensor,
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
+        track_pairs: Optional[torch.Tensor] = None,
     ):
         q_orig = q
         k_orig = k
@@ -109,7 +112,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             if cu_seqlens is not None
             else None
         )
-        g, o, A, w, h, v_new = chunk_gated_delta_rule_fwd(
+        g, o, A, w, h, h_track = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
             v=v,
@@ -120,8 +123,9 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             initial_state_indices=initial_state_indices,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            track_pairs=track_pairs,
         )
-        return o.to(q.dtype), h
+        return o.to(q.dtype), h, h_track
 
 
 @torch.compiler.disable
@@ -137,6 +141,7 @@ def chunk_gated_delta_rule(
     cu_seqlens: Optional[torch.LongTensor] = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    track_pairs: Optional[torch.Tensor] = None,
 ):
     r"""
     Args:
@@ -240,7 +245,7 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    o, h = ChunkGatedDeltaRuleFunction.apply(
+    o, h, h_track = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,
         v,
@@ -251,7 +256,10 @@ def chunk_gated_delta_rule(
         initial_state_indices,
         cu_seqlens,
         use_qk_l2norm_in_kernel,
+        track_pairs,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
+    if track_pairs is not None:
+        return o, None, h, h_track
     return o, None, h

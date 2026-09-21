@@ -60,13 +60,16 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     h,
     initial_state,
     initial_state_indices,
+    h_track,
+    track_rows,
+    NT_TRACK: tl.constexpr,
     cu_seqlens,
     chunk_offsets,
     T,
-    H: tl.constexpr,
     Hg: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
+    H: tl.constexpr,
     BT: tl.constexpr,
     BV: tl.constexpr,
     USE_G: tl.constexpr,
@@ -161,6 +164,37 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
             )
             tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
+
+        if NT_TRACK > 0:
+            # fp32 boundary snapshot (hybrid-radix GDN tracker): b_h right
+            # here IS the state entering chunk i_t -- the exact content
+            # h[i_t] carries, before its bf16 rounding. Requests whose
+            # tracked global chunk row matches store their tiles into the
+            # fp32 side buffer, so a radix-hit continuation resumes the
+            # same bits a fresh prefill would evolve (pool dtype fp32).
+            row = boh + i_t
+            for t in tl.static_range(NT_TRACK):
+                if tl.load(track_rows + t) == row:
+                    ht_base = (t * H + i_h) * V * K
+                    p_ht1 = tl.make_block_ptr(
+                        h_track + ht_base, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
+                    )
+                    tl.store(p_ht1, b_h1, boundary_check=(0, 1))
+                    if K > 64:
+                        p_ht2 = tl.make_block_ptr(
+                            h_track + ht_base, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+                        )
+                        tl.store(p_ht2, b_h2, boundary_check=(0, 1))
+                    if K > 128:
+                        p_ht3 = tl.make_block_ptr(
+                            h_track + ht_base, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
+                        )
+                        tl.store(p_ht3, b_h3, boundary_check=(0, 1))
+                    if K > 192:
+                        p_ht4 = tl.make_block_ptr(
+                            h_track + ht_base, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
+                        )
+                        tl.store(p_ht4, b_h4, boundary_check=(0, 1))
 
         p_w = tl.make_block_ptr(
             w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0)
@@ -303,7 +337,15 @@ def chunk_gated_delta_rule_fwd_h(
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Hybrid-radix GDN tracker: int64 [nt, 2] (row, pool_slot) pairs. The
+    # kernel stores each tracked chunk-boundary state tile into h_track
+    # FROM fp32 registers -- the fp32-exact state a fresh prefill evolves,
+    # unlike the bf16 h buffer the boundary rows carry.
+    track_pairs: Optional[torch.LongTensor] = None,
+    # Test hook: override the h buffer's storage dtype (tests pass float32 to
+    # get losslessly-stored boundary rows as ground truth for h_track).
+    h_dtype: Optional[torch.dtype] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE
@@ -321,9 +363,16 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, V, K)
+    h = k.new_empty(B, NT, H, V, K, dtype=h_dtype)
 
     v_new = torch.empty_like(u) if save_new_value else None
+    ntrack = 0 if track_pairs is None else int(track_pairs.shape[0])
+    if ntrack:
+        h_track = torch.zeros(
+            ntrack, H, V, K, dtype=torch.float32, device=k.device)
+        track_rows = track_pairs[:, 0].contiguous().to(torch.int32)
+    else:
+        h_track, track_rows = None, None
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
@@ -338,6 +387,9 @@ def chunk_gated_delta_rule_fwd_h(
         h=h,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
+        h_track=h_track if h_track is not None else k,  # never read when NT_TRACK == 0
+        track_rows=track_rows if track_rows is not None else k.new_zeros(1, dtype=torch.int32),
+        NT_TRACK=ntrack,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
@@ -354,4 +406,4 @@ def chunk_gated_delta_rule_fwd_h(
         IS_VARLEN=cu_seqlens is not None,
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
     )
-    return h, v_new
+    return h, v_new, h_track

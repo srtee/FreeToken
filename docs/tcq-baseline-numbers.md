@@ -74,23 +74,36 @@ First soak of a head_dim-256 (dual rotation group) checkpoint. Findings:
   10 turns, 512 tok) diverge identically on turbo8 and turbo3_tcq, with and
   without --spec-mtp; concurrent duplicate requests are always identical.
 
-### The codec-independent first-reuse flip (open ticket)
+### The cold-first-request artifact — RESOLVED (2026-09-22); not a cache or codec bug
 
-Config matrix (35B, same harness): turbo3+spec DIVERGED, turbo3 plain
-DIVERGED, turbo8 plain DIVERGED (cold server), turbo8 plain warm-tree
-STABLE, turbo8+spec (twice) STABLE. Pattern: exactly one turn-0 prompt
-flips EOS-boundary length (0 vs 8–25 tokens) between pass 1 (fresh-computed
-prefix, chunked prefill) and pass 2 (radix-cached prefix); all later turns
-and both cache-hot reruns of the same prompt are byte-identical. So the
-asymmetry is **fresh-vs-cached on the FIRST reuse only**, not codec
-quantization noise and not the spec path. Prime suspect: the hybrid-radix
-GDN snapshot donate/restore pair (`_build_track_metadata` ×64-boundary
-snapshot in `attention/linear.py`, `_cache_req_hybrid` donation,
-`_restore_linear_states` COW restore) — semantics read consistent under
-audit, so the next step is a stateprobe-style A/B (restored state vs
-recomputed state at an identical boundary). Masking hypothesis for the
-stable turbo8+spec cells: the spec arm re-verifies the first tokens after
-every restore (row A re-forward), hiding a stale-state first step.
+The "first-reuse flip" was the **first HTTP request to a freshly started
+server returning an empty response**. It only correlated with cache reuse
+because in a cold soak pass-1 turn-0 IS request #1, and pass-2 turn-0 is the
+radix-hot reply (9 chars) to the same prompt.
+
+Evidence trail:
+1. fp32 snapshot hardening (this commit): h_track boundary snapshots are now
+   bit-exact vs the kernel's internal fp32 registers
+   (`tests/kernels/test_fla_track_snapshot_fp32.py`). The flip persisted with
+   the IDENTICAL signature `[[0,0,0,9]]` — the bf16-rounded-`h` theory is dead,
+   and the hardening stands as correctness work.
+2. Post-fix turbo8 plain cold soak: same `[[0,0,0,9]]`. 8-bit quant noise
+   cannot flip a greedy tie identically to 3-bit — refutes quantization
+   noise and, being deterministic, any noise model at all.
+3. Decisive control: cold restart, one trivial warmup ping before the soak.
+   The warmup returned **empty text** (0 chars on a "Say OK" prompt); the
+   subsequent 10-turn × 3-prompt turbo3-plain soak was byte-STABLE
+   (2026-09-22, `/tmp/soak_t3_after.json` run with warmup).
+
+This also reconciles the old matrix: every DIVERGED cell ran with a cold
+server (request #1 inside the soak); every STABLE cell (warm-tree, cache-hot
+rerun) had a warm first request.
+
+Follow-up ticket (separate, pre-existing): first request after server start
+completes with 0 generated tokens and no error — suspected cold triton
+autotune path dropping the response. One empty reply per restart until fixed.
+
+## (historical) 30-min soak — RESOLVED (materializer page-id bug)
 
 ## (historical) 30-min soak — RESOLVED (materializer page-id bug)
 

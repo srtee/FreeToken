@@ -14,8 +14,8 @@ def gdn_prefill_chunk_fla(
     indices: torch.Tensor,       # [num_seqs] slot id per sequence
     cu_seqlens: torch.Tensor,    # [num_seqs+1] int64
     scale: float,
-    return_h: bool = False,
-) -> torch.Tensor:
+    track_pairs: torch.Tensor | None = None,  # [nt, 2] int64 (h_row, dst pool slot)
+):
     """Chunked gated-delta-rule prefill via the vendored fla kernel. GQA is handled
     in-kernel (q/k at num_k_heads), q/k l2norm is done in-kernel, and the per-sequence
     recurrent state is read from and written back to ``state_source[indices]`` IN PLACE
@@ -23,23 +23,29 @@ def gdn_prefill_chunk_fla(
     Fresh sequences must have their ``state_source`` slot pre-zeroed by the caller.
     Returns ``o`` of shape ``[total, num_v_heads, head_v_dim]`` (bf16).
 
-    When ``return_h=True`` also returns the per-chunk hidden-state buffer ``h`` of shape
-    ``[1, NT_total, num_v_heads, head_v_dim, head_k_dim]`` (bf16). ``h[0, boh_i + c]`` is the
-    recurrent state after ``c*64`` tokens of packed sequence ``i`` (chunk granularity 64), where
-    ``boh_i = prepare_chunk_offsets(cu_seqlens, 64)[i]``. Note the last two dims are ``[V, K]`` --
-    transposed vs ``state_source``'s ``[K, V]``. Used by the hybrid-radix track-checkpoint path."""
+    When ``track_pairs`` is given, also returns an fp32 ``h_track`` side buffer of shape
+    ``[nt, num_v_heads, head_v_dim, head_k_dim]`` holding each tracked chunk-boundary
+    state WITHOUT the bf16 rounding of the kernel's ``h`` buffer (the pool is fp32; a
+    bf16 snapshot made radix-hit continuations diverge from fresh prefills on near-tie
+    tokens). Row order follows ``track_pairs``. Used by the hybrid-radix
+    track-checkpoint path."""
     from freetoken.kernel.fla import chunk_gated_delta_rule
 
-    o, _, h = chunk_gated_delta_rule(
+    if track_pairs is not None:
+        o, _, _, h_track = chunk_gated_delta_rule(
+            q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+            initial_state=state_source, initial_state_indices=indices.to(torch.int32),
+            cu_seqlens=cu_seqlens.to(torch.int64), head_first=False,
+            use_qk_l2norm_in_kernel=True, track_pairs=track_pairs,
+        )
+        return o[0], h_track  # [total, num_v, V], [nt, num_v_heads, V, K] fp32
+    o, _, _ = chunk_gated_delta_rule(
         q=q, k=k, v=v, g=g, beta=beta, scale=scale,
         initial_state=state_source, initial_state_indices=indices.to(torch.int32),
         cu_seqlens=cu_seqlens.to(torch.int64), head_first=False,
         use_qk_l2norm_in_kernel=True,
     )
-    if return_h:
-        return o[0], h  # h: [1, NT_total, num_v_heads, head_v_dim, head_k_dim]
     return o[0]  # [total, num_v_heads, head_v_dim]
-
 
 def gdn_decode_fla(
     q: torch.Tensor,        # [1, B, num_k_heads, head_k_dim] bf16 (NOT GQA-expanded)
