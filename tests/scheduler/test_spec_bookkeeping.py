@@ -59,10 +59,12 @@ def _setup():
         _match_stop_str=lambda _req: None,
         _pending_abort_acks=set(),
         _last_data=None,
-        # the engine surface _rollback_spec_rejects touches
+        # the engine surface _rollback_spec_rejects touches (config carries
+        # the depth the rollback/prepare use for their row arithmetic)
         engine=SimpleNamespace(
             page_table=pt,
             linear_state_pool=pool,
+            config=SimpleNamespace(spec_draft_n=1),
             mtp_drafter=None,  # plain decode: the arm gate short-circuits
         ),
     )
@@ -131,7 +133,9 @@ def _ensure_ctx(pool):
 
 def _resolve(stub, batch, accepted: list[bool]):
     for req, acc in zip(batch.reqs, accepted):
-        req.spec_accepted = acc
+        # stage-4 resolve contract: how many of the n offered drafts the
+        # iteration accepted (depth-1 tests: 1 or 0)
+        req.spec_accept_count = 1 if acc else 0
     Scheduler._rollback_spec_rejects(stub, batch)
 
 
@@ -214,7 +218,7 @@ def test_gdn_snapshot_restore_invoked_on_reject():
     live_before = pool.recurrent_states[:, live].clone()
     pool.recurrent_states[:, snap].fill_(123.0)  # a distinctive pre-verify state
     batch = Batch(reqs=[req], phase="decode")
-    batch.spec_gdn_snapshot_slots = [snap]
+    batch.spec_gdn_snapshot_slots = [[snap]]
     _resolve(stub, batch, accepted=[False])
     assert torch.equal(pool.recurrent_states[:, live], pool.recurrent_states[:, snap])
     assert not torch.equal(pool.recurrent_states[:, live], live_before)
@@ -238,11 +242,11 @@ def test_row_batch_build_no_alloc_correct_tokens():
     stub.device = torch.device("cpu")
     _ensure_ctx(pool)
     stub.engine.attn_backend = get_global_ctx().attn_backend
-    stub._row_token_ids = lambda reqs, is_row_a: Scheduler._row_token_ids(stub, reqs, is_row_a)
+    stub._row_token_ids = lambda reqs, row_idx: Scheduler._row_token_ids(stub, reqs, row_idx)
     req.input_ids = req._ids_buf[: req.device_len]  # widen the view to device_len
     base_free = cm.free_slots.numel()
-    row_a = Scheduler._make_spec_row_batch(stub, [req], is_row_a=True)
-    row_b = Scheduler._make_spec_row_batch(stub, [req], is_row_a=False)
+    row_a = Scheduler._make_spec_row_batch(stub, [req], row_idx=0)
+    row_b = Scheduler._make_spec_row_batch(stub, [req], row_idx=1)
     assert cm.free_slots.numel() == base_free  # no allocation
     # positions: row A -> q=4, row B -> q+1=5
     assert row_a.positions.tolist() == [4]
@@ -275,6 +279,7 @@ def test_prepare_spec_batch_host_buf_positions():
         model=SimpleNamespace(model=SimpleNamespace(mtp=_MTP())),
         page_table=pt,
         linear_state_pool=pool,
+        config=SimpleNamespace(spec_draft_n=1),
     )
     stub.engine.stream = torch.cuda.default_stream()
     req.spec_carry = torch.zeros(8, dtype=torch.bfloat16)
@@ -284,17 +289,15 @@ def test_prepare_spec_batch_host_buf_positions():
     stub.device = torch.device("cpu")
     stub._forward_iter = 0
     stub._make_spec_row_batch = (
-        lambda reqs, *, is_row_a: Scheduler._make_spec_row_batch(stub, reqs, is_row_a=is_row_a))
-    stub._row_token_ids = lambda reqs, is_row_a: Scheduler._row_token_ids(stub, reqs, is_row_a)
+        lambda reqs, *, row_idx: Scheduler._make_spec_row_batch(stub, reqs, row_idx=row_idx))
+    stub._row_token_ids = lambda reqs, row_idx: Scheduler._row_token_ids(stub, reqs, row_idx)
     stub.engine.attn_backend = get_global_ctx().attn_backend
     stub.engine.ctx = get_global_ctx()
-    stub._mtp_replay_batch_meta = (
-        lambda batch: Scheduler._mtp_replay_batch_meta(stub, batch))
-    Scheduler._prepare_spec_batch(stub, Batch(reqs=[req], phase="decode"))
+    Scheduler._prepare_spec_batch(stub, b := Batch(reqs=[req], phase="decode"))
     assert (req.cached_len, req.device_len) == (4, 6)
     assert int(req.input_ids[4]) == 500   # c at q
     assert int(req.input_ids[5]) == 777   # d at q+1 (the draft's host slot)
-    assert req.spec_draft == 777
+    assert b.spec_drafts_gpu.tolist() == [[777]]
     # simulate the accept drain: spec path -> no append_host; the buf
     # tail [c@4, d@5] must be unchanged, bonus absent.
     BONUS = 999
@@ -373,13 +376,10 @@ def test_spec_slot_lifecycle_conservation():
 
     stub.engine.model = SimpleNamespace(model=SimpleNamespace(mtp=_MTP()))
     stub._make_spec_row_batch = (
-        lambda reqs, *, is_row_a: Scheduler._make_spec_row_batch(
-            stub, reqs, is_row_a=is_row_a))
+        lambda reqs, *, row_idx: Scheduler._make_spec_row_batch(
+            stub, reqs, row_idx=row_idx))
     stub._row_token_ids = (
-        lambda reqs, is_row_a: Scheduler._row_token_ids(stub, reqs, is_row_a))
-    stub._mtp_replay_batch_meta = (
-        lambda batch: Scheduler._mtp_replay_batch_meta(stub, batch))
-
+        lambda reqs, row_idx: Scheduler._row_token_ids(stub, reqs, row_idx))
     # a req at the post-prefill protocol state: prompt fully committed
     # (cached == device == 4), first spec input staged.
     req = _spec_req(pool, cm, tm, cached_len=4, device_len=4)
@@ -390,11 +390,9 @@ def test_spec_slot_lifecycle_conservation():
         Scheduler._prepare_spec_batch(stub, Batch(reqs=[req], phase="decode"))
         snap = pool.alloc(1)[0]   # the engine's mid-verify snapshot slot
         batch = Batch(reqs=[req], phase="decode")
-        batch.spec_gdn_snapshot_slots = [snap]
+        batch.spec_gdn_snapshot_slots = [[snap]]
         _resolve(stub, batch, accepted=[it % 2 == 0])
         pool.free([snap])         # the snapshot slot is iteration-local
-        req.spec_next_input = 100
-        req.spec_carry = torch.zeros(8, dtype=torch.bfloat16)
 
     # Finish MID-VERIFY: re-run the last prepare WITHOUT resolving, so the
     # +2 advance leaves a MAPPED uncommitted tail [cached_len, device_len)

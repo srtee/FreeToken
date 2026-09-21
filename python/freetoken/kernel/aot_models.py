@@ -155,6 +155,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=8,
         moe_intermediate_size=512,
         expert_formats=("bf16",),
+        arch_aliases=("Qwen35MoeGGUFForCausalLM",),
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B-FP8",
@@ -364,12 +365,14 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         architecture="LlamaForCausalLM",
         hidden_size=4096,
         kv_groups=((8, 128),),
+        arch_aliases=("LlamaGGUFForCausalLM",),
     ),
     AotModel(
         name="Qwen/Qwen2-7B",
         architecture="Qwen2ForCausalLM",
         hidden_size=3584,
         kv_groups=((4, 128),),
+        arch_aliases=("Qwen2GGUFForCausalLM",),
     ),
     AotModel(
         name="Qwen/Qwen3-8B",

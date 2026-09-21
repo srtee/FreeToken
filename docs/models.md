@@ -71,6 +71,24 @@ split across ranks), quantization is per-128-group and never crosses heads, and
 InnerQ scales are per-rank — each rank calibrates from its own heads'
 statistics, which is correct since scales are decode-local.
 
+## MTP speculative decoding
+
+Qwen3.5/3.6 checkpoints that ship an `mtp.*` draft head decode speculatively
+with `--spec-mtp`: each iteration drafts `--spec-draft-n` tokens (default 1)
+with the MTP head, then verifies with n+1 sequential one-row trunk forwards.
+Both the draft step and the verify forwards run as CUDA graphs (the trunk
+graph family is excluded instead). Greedy-lossless: output is byte-identical
+to plain decode at either depth — rejects roll back cleanly.
+
+Whether it pays is a concurrency question, not just an acceptance one: the
+verify costs n+1 trunk forwards per iteration, so spec wins only where
+per-iteration token yield beats the extra forward cost — long generations at
+low concurrency. Under batched decoding (several concurrent requests) plain
+decode amortizes the forward over many sequences and usually wins; the
+stage-5 soak numbers in [mtp-baseline-numbers.md](mtp-baseline-numbers.md)
+are the reference. Acceptance telemetry rides the decode log line
+(`#drafted: N, #accepted: k (rate r)`); r ≥ 0.55 on prose is healthy.
+
 ## GGUF checkpoints
 
 `ft serve --model <file>.gguf` loads GGUF files directly — config and tokenizer

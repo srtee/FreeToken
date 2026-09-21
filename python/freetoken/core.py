@@ -27,7 +27,13 @@ class SamplingParams:
 
     @property
     def is_greedy(self) -> bool:
-        return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
+        # Deterministic iff argmax: temperature <= 0 (T->0 softmax) or
+        # top_k == 1 (single survivor). top_p never matters — the max-prob
+        # token always survives a top_p filter — so a model-default top_p
+        # (e.g. Qwen3.6's 0.95 merged over an explicit temperature-0 HTTP
+        # request) must NOT demote a greedy request to sampled. It feeds
+        # the sampler's argmax fast path and the MTP spec arm gate.
+        return self.temperature <= 0.0 or self.top_k == 1
 
 
 @dataclass(eq=False)

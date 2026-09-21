@@ -1,4 +1,4 @@
-# Wave-2 Stage 4 — depth-2 draft chain: status & findings
+# Wave-2 Stage 4 + 5 — depth-2 draft chain, soak: status & findings
 
 **As of 2026-09-21. STAGE 4 GATE: ALL PASS** — losslessness byte-identical
 (depth 2 == plain == depth 1) AND the acceptance gate met after fixing the
@@ -100,3 +100,41 @@ Depth 1 is itself slower than plain on this short-window gate run (62.3 vs
 should be re-checked in the stage-5 soak). The clone fix makes depth 2
 CORRECT — a viable flag for latency-sensitive long-generation workloads
 where per-iteration yield (≤ 3 tokens/iter) beats per-step overhead.
+
+## Stage 5 soak (2026-09-21, 35B NVFP4, turbo8 @ 128k, 4 concurrent)
+
+Byte-stability gate: two consecutive greedy passes byte-identical, two
+concurrent clients byte-identical — **STABLE**. Per-window acceptance
+telemetry r = 0.65–0.92 (≥ 0.55 gate). `ft ctl stats` clean across windows.
+
+Load battery (nreq=24×60 prompts, 512 max tokens, bs=4, greedy via HTTP):
+
+| window | aggregate gen tok/s | p50 | p95 | errors |
+|---|---|---|---|---|
+| plain | 88.7 | 12.0s | 14.7s | 0 |
+| `--spec-mtp` (depth 1) | 81.3 | 13.6s | 21.5s | 0 |
+
+Per-stream decode: spec 67–110 tok/s vs plain ~21 tok/s (≈3–5× single-stream
+latency win). Aggregate throughput at full 4-way concurrency: spec −8% with a
+worse tail (the verify is n+1 sequential 1-row forwards; plain batches 4 rows
+per forward). **Launch-config call: `--spec-mtp` ON for latency-bound serving
+(local coding agents, 1–2 streams); OFF for saturated max-throughput serving.**
+
+Two production bugs the soak caught (both fixed):
+
+1. **`SamplingParams.is_greedy` required `top_p == 1.0`** — every HTTP
+   request with model-default sampling (Qwen3.6 ships top_p 0.95) silently
+   degraded to plain decode; spec never armed outside in-process gates.
+   Greedy is now `temperature <= 0 or top_k == 1`.
+2. **Mixed-device `spec_carry` stack** — prefill seeds the carry as a GPU
+   hidden row, the resolve refreshes it to CPU; the first spec batch mixing
+   fresh and continuing reqs crashed the scheduler worker. Staging now
+   normalizes to the engine device.
+
+Test repairs riding the same commit: `tests/scheduler/test_spec_bookkeeping.py`
+fixtures updated to the stage-4 `row_idx=`/`spec_drafts_gpu` interface (the
+8 failures predate the soak — the stage-4 commit didn't run that file), and
+`aot_models.py` gained the GGUF `arch_aliases` the wave-1..4 commits owed
+(`LlamaGGUFForCausalLM`, `Qwen2GGUFForCausalLM`, `Qwen35MoeGGUFForCausalLM`).
+
+**Wave 2 complete: stages 1–5 LANDED.**

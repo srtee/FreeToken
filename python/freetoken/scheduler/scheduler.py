@@ -1125,8 +1125,13 @@ class Scheduler(SchedulerIOMixin):
         self._forward_iter += 1
         cm.maybe_free_swa_out_of_window(batch.reqs, forward_iter=self._forward_iter)
         # --- draft chain + carry staging ---
-        carries = torch.stack([r.spec_carry for r in batch.reqs], dim=0).to(
-            device, non_blocking=True)
+        # Per-req carries mix devices: prefill seeds spec_carry as a GPU
+        # hidden row, every resolve refreshes it to CPU (the drain's
+        # host-visible staging) — a batch combining fresh admissions with
+        # already-speculating reqs stacks both. Normalize per req.
+        carries = torch.stack(
+            [r.spec_carry.to(device, non_blocking=True) for r in batch.reqs],
+            dim=0)
         input_tokens = torch.tensor(
             [req.input_ids[req.cached_len].item() for req in batch.reqs],
             dtype=torch.int32, device=device)

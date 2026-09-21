@@ -1,11 +1,12 @@
 # MTP Wave 2 — Speculative decode in production (draft + verify, graphs)
 
-Status: **stages 1–4 LANDED** (stage-3 gate ALL PASS 2026-09-17, commits
-`22a83b8` + `f08f033`; stage-4 gate ALL PASS 2026-09-21 — depth-2
-acceptance collapse root-caused to draft-graph view clobbering and fixed;
-depth 2 config-gated, default 1 on perf; see `mtp-stage4-status.md`).
-Supersedes the Wave-2 section of `mtp-plan.md` (kept for history). Stage 5
-(soak + final docs) is the remaining open stage. Prerequisite state at
+Status: **stages 1–5 LANDED** (stage-3 gate ALL PASS 2026-09-17, commits
+`22a83b8` + `f08f033`; stage-4 gate ALL PASS 2026-09-21 — depth-2 acceptance
+collapse root-caused to draft-graph view clobbering and fixed; stage-5 soak
+STABLE 2026-09-21, spec serving verdict in `mtp-stage4-status.md`. Depth 2
+config-gated, default 1 on perf).
+Supersedes the Wave-2 section of `mtp-plan.md` (kept for history).
+Prerequisite state at
 planning time: waves 0 + 1 landed
 (`8da83f9`, `8203e81`) — MTP weights load, `MTPHead.draft_step` runs on the
 trunk attention (layer-40 KV), `--spec-mtp` plumbs through, `verify_chain`
