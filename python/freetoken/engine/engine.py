@@ -20,7 +20,7 @@ from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
-from freetoken.engine.spec_mtp import batch_resolve
+from freetoken.engine.spec_mtp import batch_resolve_chain, per_position_accepts
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
@@ -1170,11 +1170,12 @@ class Engine:
         drafter = self.mtp_drafter
         mtp = self.model.model.mtp
         bs = batch.size
-        # One trunk forward per verify row (row A: [bs] rows, row B: [bs]
-        # rows — separate extends so each row's GDN state lands in stream
-        # order and the per-row hidden is directly addressable). Each row
-        # batch carries its own page slots, positions, and out_loc; the
-        # model.forward() consumes the batch ctx.
+        n_rows = len(batch.spec_row_batches)  # verify rows = drafts + 1
+        # One trunk forward per verify row ([bs] rows each — separate
+        # extends so each row's GDN state lands in stream order and the
+        # per-row hidden is directly addressable). Each row batch carries
+        # its own page slots, positions, and out_loc; the model.forward()
+        # consumes the batch ctx.
         row_hiddens: list[torch.Tensor] = []
         row_logits: list[torch.Tensor] = []
         import os as _os
@@ -1249,44 +1250,54 @@ class Engine:
                 row_hiddens_i = row_hiddens_i[:bs].clone()
             row_logits.append(row_logits_i[:bs])
             row_hiddens.append(row_hiddens_i[:bs])
-            # MID-VERIFY GDN SNAPSHOT (defect-2 fix): the state after row
-            # A (position q processed) is exactly what a reject's committed
-            # frontier [0, q+1) needs. In the graphed arm this copy runs on
-            # the engine stream AFTER the row-A replay and BEFORE row B's —
-            # the same program order the eager path relies on. (Row B never
-            # snapshots: nothing consumes a state after the last row.)
-            if row_idx == 0 and batch.spec_gdn_snapshot_slots:
+            # MID-VERIFY GDN SNAPSHOT: the state after each row j < n is
+            # exactly what a reject at draft k = j needs (the committed
+            # frontier [0, q+j+1)). One snapshot per (req, row); in the
+            # graphed arm this copy runs on the engine stream AFTER the
+            # row's replay and BEFORE the next row's — the same program
+            # order the eager path relies on. (The last row never
+            # snapshots: nothing consumes a state after it.)
+            if row_idx < n_rows - 1 and batch.spec_gdn_snapshot_slots:
                 pool = self.linear_state_pool
                 if pool is not None:
-                    for req, snap_slot in zip(
+                    for req, snap_slots in zip(
                             batch.reqs, batch.spec_gdn_snapshot_slots):
-                        pool.copy_from(req.linear_slot_idx, snap_slot)
-        drafter.stats.drafted += bs
-        row_a = row_logits[0].argmax(dim=-1).to(torch.int32)
-        row_b = row_logits[1].argmax(dim=-1).to(torch.int32)
-        drafts = torch.tensor([r.spec_draft for r in batch.reqs],
-                              dtype=torch.int32, device=self.device)
+                        pool.copy_from(req.linear_slot_idx,
+                                       snap_slots[row_idx])
+        drafter.stats.drafted += bs * (n_rows - 1)
+        row_argmaxes = torch.stack(
+            [row_logits[j].argmax(dim=-1).to(torch.int32)
+             for j in range(n_rows)], dim=1)      # [B, n+1]
+        drafts = batch.spec_drafts_gpu            # [B, n] int32 GPU
         import os as _os
         if _os.environ.get("FT_DEBUG_STORE"):
             import sys as _sys
-            print(f"[resolve] a={row_a.tolist()} b={row_b.tolist()} "
+            print(f"[resolve] rows={row_argmaxes.tolist()} "
                   f"d={drafts.tolist()}", file=_sys.stderr)
-        steps = batch_resolve(row_a, row_b, drafts)
+        steps = batch_resolve_chain(row_argmaxes, drafts)
         drafter.stats.accepted += sum(s.accepted for s in steps)
+        if len(drafter.stats.accepted_at) != n_rows - 1:
+            drafter.stats.accepted_at = [0] * (n_rows - 1)
+        for j, c in enumerate(per_position_accepts(steps, n_rows - 1)):
+            drafter.stats.accepted_at[j] += c
         carry = torch.stack(
             [row_hiddens[s.carry_row][i] for i, s in enumerate(steps)], dim=0)
-        # MTP replay: layer-40 rows for BOTH verify positions in one
-        # batched forward (rows [c@q, d@q+1]; per-row carries: row 0 =
-        # the pending carry, row 1 = row A's trunk hidden). Replay
-        # outputs other than the KV writes are discarded.
+        # MTP replay: one layer-40 row per offered draft, batched into a
+        # single forward (draft [b, c] @ position q+c+1). Per-row carries:
+        # row 0 = the pending carry, row c = verify row c-1's trunk hidden
+        # (each draft consumes the trunk hidden at its seed position).
+        # Replay outputs other than the KV writes are discarded.
         replay_tokens = torch.stack(
-            [batch.spec_input_tokens_gpu, drafts], dim=1).reshape(-1)
+            [batch.spec_input_tokens_gpu]
+            + [drafts[:, c] for c in range(n_rows - 1)], dim=1).reshape(-1)
         replay_carries = torch.stack(
-            [batch.spec_carry_gpu, row_hiddens[0]], dim=1).reshape(2 * bs, -1)
+            [batch.spec_carry_gpu]
+            + [row_hiddens[j] for j in range(n_rows - 1)],
+            dim=1).reshape(n_rows * bs, -1)
         replay_batch = self._mtp_replay_batch(batch)
         with self.ctx.forward_batch(replay_batch):
             mtp.forward_rows(replay_carries, replay_tokens, with_logits=False)
-        return self._build_spec_output(batch, steps, carry, drafts)
+        return self._build_spec_output(batch, steps, carry)
 
     def _mtp_replay_batch(self, batch: Batch) -> Batch:
         """A phase="decode" bookkeeping batch for the 2-row MTP replay:
@@ -1301,14 +1312,15 @@ class Engine:
         replay.attn_metadata = batch.spec_replay_attn_metadata
         return replay
 
-    def _build_spec_output(self, batch: Batch, steps, carry: torch.Tensor,
-                           drafts: torch.Tensor) -> ForwardOutput:
+    def _build_spec_output(self, batch: Batch, steps,
+                           carry: torch.Tensor) -> ForwardOutput:
         """The spec batch's ForwardOutput: next_tokens = the FIRST emitted
         token (GPU, for the scheduler's token_pool write mapping — the
         last verify position), plus the drain's per-req extra emissions.
 
         Per req (loop model / semantics doc Q3):
-          accept: emitted = [d, bonus] — next_tokens = d, extra = bonus.
+          accept (k drafts): emitted = [d_1..d_k, bonus] — next_tokens =
+          d_1, extra = the remaining k entries (right-padded -1).
           reject: emitted = [a]        — next_tokens = a, extra = -1.
         The reject's rollback (page-slot free, GDN restore, device_len
         rewind) is applied by the caller right after this returns — it
@@ -1323,9 +1335,12 @@ class Engine:
         device = self.device
         first = torch.tensor(
             [s.emitted[0] for s in steps], dtype=torch.int32, device=device)
-        extra = torch.tensor(
-            [(s.emitted[1] if s.accepted else -1) for s in steps],
-            dtype=torch.int32, device=device)
+        max_extra = max((len(s.emitted) - 1 for s in steps), default=1)
+        extra = torch.full((bs, max_extra), -1, dtype=torch.int32,
+                           device=device)
+        for i, s in enumerate(steps):
+            for j, t in enumerate(s.emitted[1:]):
+                extra[i, j] = t
         next_input = torch.tensor(
             [s.next_input for s in steps], dtype=torch.int32, device=device)
         accepted = torch.tensor([s.accepted for s in steps],
@@ -1336,6 +1351,7 @@ class Engine:
         for i, req in enumerate(batch.reqs):
             req.spec_next_input = int(next_input[i].item())
             req.spec_carry = carry_cpu[i]
+            req.spec_accept_count = int(steps[i].accepted)
             req.spec_accepted = bool(accepted[i].item())
         copy_done = torch.cuda.Event()
         copy_done.record(self.stream)

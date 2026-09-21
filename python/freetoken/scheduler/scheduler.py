@@ -344,8 +344,10 @@ class Scheduler(SchedulerIOMixin):
                     # client's terminal reply.
                     continue
                 emitted = [next_tokens_cpu[i]]
-                if spec_extra_cpu is not None and int(spec_extra_cpu[i].item()) >= 0:
-                    emitted.append(spec_extra_cpu[i])
+                if spec_extra_cpu is not None:
+                    for tok in spec_extra_cpu[i]:
+                        if int(tok.item()) >= 0:
+                            emitted.append(tok)
                 # report_batch counted the default 1/req; count the spec
                 # bonus emission(s) on top for an exact throughput window.
                 self.status_reporter.count_generated_tokens(len(emitted) - 1)
@@ -1031,196 +1033,210 @@ class Scheduler(SchedulerIOMixin):
         inside _forward, before filter_reqs — every req mutation completes
         before the overlap scheduler prepares the next batch).
 
-        accept: cached_len = device_len — the verify committed BOTH rows
-        (positions q and q+1 verified; the KV content is real), so
-        allocate_paged's next span [cached_len, device_len) is exactly the
-        2 NEW positions of the next iteration.
+        Full accept (k == depth n): cached_len = device_len — the verify
+        committed ALL rows (every position verified; the KV content is
+        real), so allocate_paged's next span [cached_len, device_len) is
+        exactly the next iteration's new positions.
 
-        reject: free row B's page slot (position q+1 — the next
-        iteration's verify re-writes it, deterministic content makes a
-        free correct for full attn), restore the MID-VERIFY GDN snapshot
-        (the engine captured the state AFTER row A = covering [0, q+1) —
-        exactly the reject's committed frontier), rewind device_len by 1,
-        and mark spec_undone so the next
-        iteration's verify re-processes the undone position as its row A:
-        cached_len ADVANCES to the rewound device_len (row A's position q
-        is processed+verified; committed = [0, q+1) — the span never
-        grows under consecutive rejects).
+        k < n: free the UNVERIFIED draft rows' page slots (positions
+        q+k+1..q+n — the next iteration's verify re-writes them with
+        deterministic content, so freeing is correct), restore the
+        MID-VERIFY GDN snapshot taken after verify row k (the state
+        covering exactly the committed frontier [0, q+k+1)), rewind
+        device_len to q+k+1, and record spec_undone = n - k. cached_len
+        ADVANCES to the rewound device_len (rows 0..k are processed AND
+        verified — the committed span never shrinks under consecutive
+        rejects).
         """
         cm = self.cache_manager
+        pool = self.engine.linear_state_pool
+        snapshot_slot_lists = batch.spec_gdn_snapshot_slots
+        n = self.engine.config.spec_draft_n
         with cm.lazy_free_region():
             for i, req in enumerate(batch.reqs):
-                if req.spec_accepted:
+                k = req.spec_accept_count
+                if k >= n:
                     req.cached_len = req.device_len
-                    req.spec_undone = 0
-                    req.spec_mapped_tail = 0
-                    continue
-                # 1. free row B's page slot: the 2nd verify position's
-                # slot (page_table row at device_len - 1: the reqs'
-                # device_len was advanced by 2 by _prepare_spec_batch).
-                # The same slice-free pattern the cache manager's commit
-                # path uses (page_indices[a:b]); the page-table entry is
-                # zeroed so the next allocate_paged re-maps the position.
-                row_b = self.engine.page_table[req.table_idx, req.device_len - 1 : req.device_len]
-                cm._free(row_b)
-                self.engine.page_table[req.table_idx, req.device_len - 1] = 0
-                # 2. restore the GDN snapshot into the live slot.
-                if eng_snapshot_slots := batch.spec_gdn_snapshot_slots:
-                    self.engine.linear_state_pool.copy_from(
-                        eng_snapshot_slots[i], req.linear_slot_idx)
-                # 3. rewind device_len by 1 (the engine's resolve consumed
-                # the 2-slot advance; the undo drops row B). cached_len
-                # ADVANCES to the rewound device_len: row A's position q
-                # is processed+verified, so committed = [0, q+1) — leaving
-                # cached at q made the unprocessed span grow by 2 every
-                # consecutive reject (extend_len 10 after 5 rejects —
-                # the plain-decode crash: a decode batch with a 10-token
-                # "extend" breaks the GDN one-row-per-req conv kernel).
-                req.device_len -= 1
-                req.cached_len = req.device_len
-                req.spec_undone = 1
+                else:
+                    # 1. free the unverified draft rows' page slots
+                    # [q+k+1, q+n); the page-table entries are zeroed so
+                    # the next allocate_paged re-maps them.
+                    head, tail = req.cached_len + k + 1, req.device_len
+                    cm._free(self.engine.page_table[req.table_idx, head:tail])
+                    self.engine.page_table[req.table_idx, head:tail] = 0
+                    # 2. restore the GDN snapshot taken after verify row k
+                    # into the live slot (a reject at k needs exactly this).
+                    if snapshot_slot_lists:
+                        pool.copy_from(snapshot_slot_lists[i][k],
+                                       req.linear_slot_idx)
+                    # 3. rewind device_len to the committed frontier
+                    # q+k+1; cached_len advances to match (docstring).
+                    req.device_len = head
+                    req.cached_len = head
+                req.spec_undone = n - k
                 req.spec_mapped_tail = 0
+        # the extra per-iteration snapshot slots are batch scratch:
+        # release them for the whole batch regardless of per-req outcome
+        if batch.spec_gdn_extra_slots and pool is not None:
+            pool.free(batch.spec_gdn_extra_slots)
+            batch.spec_gdn_extra_slots = None
 
     def _prepare_spec_batch(self, batch: Batch) -> None:
-        """Advance each req by 2 device positions, allocate 2 fresh page
-        slots per req (the existing allocate_paged path), build the two
-        1-row verify batches (phase="prefill" extends — the same
-        cached_len-leads-device_len mechanism a prefill extend uses) and
-        stage the MTP replay's tensors. Consumes the PREVIOUS iteration's
-        resolve state off the reqs (spec_carry / spec_next_input).
+        """Advance each req by n+1 device positions, allocate the fresh
+        page slots (the existing allocate_paged path), chain the MTP
+        draft n times, build the n+1 1-row verify batches (see
+        _make_spec_row_batch) and stage the MTP replay's tensors.
+        Consumes the PREVIOUS iteration's resolve state off the reqs
+        (spec_carry / spec_next_input).
 
-        Mechanism flagged (report item): prefill extends advance
-        cached_len only in complete_one AFTER the forward; here the
-        scheduler advances device_len by 2 (extending the req's live
-        region by the verify rows) BEFORE the forwards, and
-        allocate_paged covers [cached_len, device_len). Row A's token is
-        the req's own last input (c, or the reject's corrected a via
-        spec_next_input), row B's is spec_draft.
+        The scheduler advances device_len by n+1 (extending the req's
+        live region by the verify rows) BEFORE the forwards, and
+        allocate_paged covers [cached_len, device_len). Row 0's token is
+        the req's certain input (c, or the reject's corrected argmax
+        staged in spec_next_input); draft rows 1..n carry the chained
+        drafts d_0..d_{n-1}.
         """
         eng = self.engine
         device = self.device
-        # --- advance: 2 device positions per req, writing the tokens ---
+        n = eng.config.spec_draft_n
+        rows = n + 1
+        # --- advance: n+1 device positions per req, writing the tokens ---
         for req in batch.reqs:
-            # Row A token: the next certain input (after a reject this is
-            # the corrected row-A argmax the previous resolve staged).
-            # PLAIN PROTOCOL: the pending token lives at [cached_len]
-            # (the plain drain's append + complete_one leave device_len =
-            # cached_len + 1 with the token staged at cached_len). The
-            # verify rows are [cached_len, cached_len + 2): row A writes
-            # AT cached_len — writing at device_len put row A one
-            # position late, duplicated the pending token, and left an
-            # allocated-but-never-written KV slot in the attention
-            # window (the trunk-divergence doubling).
-            row_a_tok = req.spec_next_input
-            req.input_ids = req._ids_buf[: req.cached_len + 2]
-            req.input_ids[req.cached_len] = row_a_tok
-            req.device_len = req.cached_len + 2
+            # Row 0 token: the next certain input (after a reject this is
+            # the corrected row-0 argmax the previous resolve staged).
+            # The verify rows are [cached_len, cached_len + n + 1): row 0
+            # writes AT cached_len — the pending token lives at
+            # [cached_len] (plain protocol: device_len = cached_len + 1
+            # with the token staged there); writing it at the advanced
+            # device_len would duplicate the token and leave an
+            # allocated-but-never-written slot inside the window.
+            req.input_ids = req._ids_buf[: req.cached_len + rows]
+            req.input_ids[req.cached_len] = req.spec_next_input
+            req.device_len = req.cached_len + rows
         cm = self.cache_manager
-        cm.allocate_paged(batch.reqs)  # covers [cached_len, device_len) for both rows
-        # From here to the resolve, both verify pages are mapped-but-
+        cm.allocate_paged(batch.reqs)  # covers [cached_len, device_len)
+        # From here to the resolve, the verify pages are mapped-but-
         # uncommitted: an abort/finish in this window frees them via
-        # spec_mapped_tail (plain decode's stale-table-row tail must NOT be
-        # inferred from device_len > cached_len — see Req.spec_mapped_tail).
+        # spec_mapped_tail (the plain decode's stale-table-row tail must
+        # NOT be inferred from device_len > cached_len — see
+        # Req.spec_mapped_tail).
         for req in batch.reqs:
             req.spec_mapped_tail = req.device_len - req.cached_len
         self._forward_iter += 1
         cm.maybe_free_swa_out_of_window(batch.reqs, forward_iter=self._forward_iter)
-        # --- draft + carry staging ---
+        # --- draft chain + carry staging ---
         carries = torch.stack([r.spec_carry for r in batch.reqs], dim=0).to(
             device, non_blocking=True)
         input_tokens = torch.tensor(
-            [req.input_ids[req.device_len - 2].item() for req in batch.reqs],
+            [req.input_ids[req.cached_len].item() for req in batch.reqs],
             dtype=torch.int32, device=device)
         batch.spec_carry_gpu = carries
         batch.spec_input_tokens_gpu = input_tokens
-        # --- the drafts (need the carry; the MTP forward is 1 layer, 1
-        # token/req — cheap, runs on the engine stream before the trunk).
-        # The draft's host-buf write (d at q+1) must land BEFORE the row
-        # batches are built — row B's input_ids gather reads [q+1] off
-        # the host buf (_row_token_ids), and building them earlier hands
-        # the embedding gather garbage (uninit ids_buf memory) ---
-        # that was the CUDA illegal-access at the row-A forward.
+        # --- the drafts: step k+1 consumes (carry_k, d_k); the chain is
+        # greedy argmax all the way down. Each step's host-buf write
+        # (d_k at q+1+k) must land BEFORE the row batches are built —
+        # the draft rows' token gathers read [q+1..q+n] off the host buf
+        # (_row_token_ids); building them earlier gathers the ids_buf's
+        # uninitialized memory.
         mtp = eng.model.model.mtp
-        draft_batch = self._make_spec_row_batch(batch.reqs, is_row_a=True)
+        # The draft rides row 0's staging (positions q, out_loc = pt[q]):
+        # every chain step piles its KV row onto the SAME row-0 slot, and
+        # the verify's rows re-write the layer-(num_layers) table across
+        # [q, q+n] with deterministic content — all piled draft rows are
+        # overwritten before anything reads them.
+        draft_batch = self._make_spec_row_batch(batch.reqs, row_idx=0)
         draft_batch.input_ids = input_tokens
-        # Wave-2 stage 2: the draft rides the per-bs CUDA-graph family when
-        # the engine captured it; eager stays the reference oracle
-        # (FT_SPEC_DRAFT_EAGER keeps the runner None) and the fallback for
-        # a bs over the family. draft_batch construction stays BEFORE the
-        # call either way: it supplies the positions/out_loc/metadata the
-        # captured attention needs on replay. The host-buf write ordering
-        # below (drafts -> req.input_ids[q+1] before the row batches are
-        # built) is unchanged in both arms.
+        # Wave-2 stage 2: the draft rides the per-bs CUDA-graph family
+        # when the engine captured it; eager stays the reference oracle
+        # (FT_SPEC_DRAFT_EAGER keeps the runner None) and the fallback
+        # for a bs over the family. draft_batch supplies the staged
+        # positions/out_loc/metadata both arms consume.
         runner = getattr(eng, "draft_graph_runner", None)
-        if runner is not None and runner.can_draft(batch.size):
-            with torch.cuda.stream(eng.stream):
-                drafts, _carry_out = runner.draft(carries, input_tokens, draft_batch)
-        else:
-            with torch.cuda.stream(eng.stream):
-                with eng.ctx.forward_batch(draft_batch):
-                    drafts = mtp.draft_step(
-                        carries, input_tokens)[1].argmax(dim=-1).to(torch.int32)
-        for req, d in zip(batch.reqs, drafts.tolist()):
-            req.spec_draft = int(d)
-            # BUG-3 fix: the draft's host-buf slot. The verify's row B
-            # consumes d at position q+1; the host ids view must hold it
-            # (the KV position and the ids tail must agree for stop-string
-            # matching and radix commits). On reject the rewound view
-            # (device_len = q+1) excludes this write — the next
-            # iteration's row-A write overwrites it with the corrected
-            # token.
-            q = req.device_len - 2
-            req.input_ids[q + 1] = d
-            # The draft's layer-40 KV row at position q rides the same
-            # draft forward (its out_loc = row A's slot; same position q
-            # — the verify's row A re-writes it with deterministic content).
-        # --- MTP replay tensors: 2 rows/req, positions [q, q+1] ---
-        pos_host = torch.empty(2 * batch.size, dtype=torch.int32, pin_memory=True)
-        loc_host = torch.empty(2 * batch.size, dtype=torch.int64, pin_memory=True)
-        tok_host = torch.empty(2 * batch.size, dtype=torch.int32, pin_memory=True)
-        for i, (req, d) in enumerate(zip(batch.reqs, drafts.tolist())):
-            q = req.device_len - 2
+        use_graph = runner is not None and runner.can_draft(batch.size)
+        draft_steps: list[torch.Tensor] = []
+        tokens = input_tokens
+        for _ in range(n):
+            if use_graph:
+                with torch.cuda.stream(eng.stream):
+                    d, carries = runner.draft(carries, tokens, draft_batch)
+            else:
+                with torch.cuda.stream(eng.stream):
+                    with eng.ctx.forward_batch(draft_batch):
+                        carries, logits = mtp.draft_step(carries, tokens)
+                        d = logits.argmax(dim=-1).to(torch.int32)
+            draft_steps.append(d)
+            tokens = d
+        batch.spec_drafts_gpu = torch.stack(draft_steps, dim=1)  # [B, n]
+        for i, req in enumerate(batch.reqs):
+            for k, d_k in enumerate(draft_steps):
+                # the verify's draft row k consumes d_k at position q+1+k;
+                # the host ids tail must hold it (the KV position and the
+                # ids tail must agree for stop-string matching and radix
+                # commits). On reject the rewound view excludes these
+                # writes — the next iteration's row-0 write overwrites
+                # them with the corrected token.
+                req.input_ids[req.cached_len + 1 + k] = int(d_k[i].item())
+        # --- MTP replay tensors: rows per req = n+1, positions [q, q+n] ---
+        pos_host = torch.empty(rows * batch.size, dtype=torch.int32,
+                               pin_memory=True)
+        loc_host = torch.empty(rows * batch.size, dtype=torch.int64,
+                               pin_memory=True)
+        tok_host = torch.empty(rows * batch.size, dtype=torch.int32,
+                               pin_memory=True)
+        for i, req in enumerate(batch.reqs):
+            q = req.cached_len
             pt = self.engine.page_table[req.table_idx]
-            for j in range(2):
-                pos_host[2 * i + j] = q + j
-                loc_host[2 * i + j] = int(pt[q + j].item())
-                tok_host[2 * i + j] = (
-                    req.input_ids[q].item() if j == 0 else d)
+            for j in range(rows):
+                pos_host[rows * i + j] = q + j
+                loc_host[rows * i + j] = int(pt[q + j].item())
+                tok_host[rows * i + j] = req.input_ids[q + j].item()
         batch.spec_replay_positions = pos_host.to(device, non_blocking=True)
         batch.spec_replay_out_loc = loc_host.to(device, non_blocking=True)
         batch.spec_replay_input_ids = tok_host.to(device, non_blocking=True)
-        # --- verify row batches: built AFTER the draft's host-buf write so
-        # row B's [q+1] gather sees the real draft token (see the draft
-        # block comment above for the failure mode this ordering fixes) ---
-        row_a_batch = self._make_spec_row_batch(batch.reqs, is_row_a=True)
-        row_b_batch = self._make_spec_row_batch(batch.reqs, is_row_a=False)
-        batch.spec_row_batches = [row_a_batch, row_b_batch]
-        # replay metadata: 2-row extend shape per req (kv = the full seq).
-        # _SpecRowReq views give each req a 2-token span [q, q+1) so the
-        # backend builds a 2bs-row extend metadata; the result rides the
-        # batch (spec_replay_attn_metadata) for the engine's replay.
+        # --- verify row batches: built AFTER the drafts' host-buf writes
+        # so the draft rows' gathers see the real draft tokens ---
+        batch.spec_row_batches = [
+            self._make_spec_row_batch(batch.reqs, row_idx=k)
+            for k in range(rows)]
+        # replay metadata: an (n+1)-row extend per req (span [q, q+n]).
+        # _SpecRowPair views give each req the (n+1)-token span so the
+        # backend builds the (n+1)·bs-row extend metadata; the result
+        # rides the batch (spec_replay_attn_metadata) for the engine's
+        # replay.
         replay_reqs = [_SpecRowPair(req) for req in batch.reqs]
         replay_meta = Batch(reqs=replay_reqs, phase="prefill")
         replay_meta.padded_reqs = replay_reqs
         eng.attn_backend.prepare_metadata(replay_meta)
         batch.spec_replay_attn_metadata = replay_meta.attn_metadata
-        # --- GDN snapshot slot staging (hybrid only) ---
+        # --- GDN snapshot slot staging (hybrid only): one slot per
+        # snapshot row 0..n-1 — slot 0 is the req's idle ping-pong track,
+        # slots 1..n-1 are fresh per-iteration pool allocs (released by
+        # _rollback_spec_rejects after the resolve).
         if eng.linear_state_pool is not None and cm.is_hybrid:
             pool = eng.linear_state_pool
-            batch.spec_gdn_snapshot_slots = [r.mamba_ping_pong[r.mamba_next_track_idx]
-                                             for r in batch.reqs]
+            per_req_extra: list[list[int]] = [[] for _ in batch.reqs]
+            if n > 1:
+                extra = pool.alloc((n - 1) * batch.size)
+                batch.spec_gdn_extra_slots = extra
+                per_req_extra = [
+                    extra[i * (n - 1):(i + 1) * (n - 1)]
+                    for i in range(batch.size)]
+            batch.spec_gdn_snapshot_slots = [
+                [r.mamba_ping_pong[r.mamba_next_track_idx]] + per_req_extra[i]
+                for i, r in enumerate(batch.reqs)]
 
-    def _make_spec_row_batch(self, reqs: List[Req], *, is_row_a: bool) -> Batch:
-        """A 1-row-per-req batch for one verify row: phase="decode",
-        extend_len 1 per req. cached_len/device_len are NOT touched (the
-        per-row batch's own bookkeeping is derived); the row's token ids
-        come straight from the caller's staged tokens ([c, d] per req:
-        row A takes index 0::2, row B 1::2) — the token_pool slots at the
-        verify positions hold NO valid tokens for this iteration (the
-        output write puts one token per iteration at the frontier only).
+    def _make_spec_row_batch(self, reqs: List[Req], *, row_idx: int) -> Batch:
+        """A 1-row-per-req batch for one verify row (row_idx 0 = the
+        certain row, 1..n = the draft rows): phase="decode", extend_len 1
+        per req. cached_len/device_len are NOT touched (the per-row
+        batch's own bookkeeping is derived); the row's token ids come
+        straight from the staged ids tail ([c, d_0..d_{n-1}] per req:
+        row k takes index k) — the token_pool slots at the verify
+        positions hold NO valid tokens for this iteration (the output
+        write puts one token per iteration at the frontier only).
         Positions/out_loc/metadata use the standard paths on the wrapper
         view (NO allocation here — the batch-level allocate_paged already
-        covers both row spans; allocating here would double-allocate and
+        covers all row spans; allocating here would double-allocate and
         clobber the mapped table entries)."""
         # Verify rows are phase="decode" batches, NOT prefill extends: the
         # GDN fla CHUNK kernel's 1-token-chunk-with-initial-state path
@@ -1232,9 +1248,9 @@ class Scheduler(SchedulerIOMixin):
         # 1-token-per-req shape exactly (conv shift-append + fused SSM
         # update), and the attention decode kernel is exact for q_len=1
         # over the full paged window.
-        # Each row batch gets its OWN view of the req state: row A
-        # processes [device_len - 2, device_len - 1), row B the last slot.
-        row_reqs = [_SpecRowReq(req, 0 if is_row_a else 1) for req in reqs]
+        # Each row batch gets its OWN view of the req state: row k
+        # processes position q + k (q = the req's cached_len).
+        row_reqs = [_SpecRowReq(req, row_idx) for req in reqs]
         b = Batch(reqs=row_reqs, phase="decode")
         b.padded_reqs = row_reqs
         b.positions = _make_positions(b, self.device)
@@ -1247,16 +1263,15 @@ class Scheduler(SchedulerIOMixin):
             ).to(self.device, non_blocking=True)
             b.fla_metadata = build_fla_metadata(b, self.device)
         self.engine.attn_backend.prepare_metadata(b)
-        b.input_ids = self._row_token_ids(reqs, is_row_a).to(
+        b.input_ids = self._row_token_ids(reqs, row_idx).to(
             self.device, non_blocking=True)
         return b
 
-    def _row_token_ids(self, reqs: List[Req], is_row_a: bool) -> torch.Tensor:
-        """[B] int32 host tensor of the row's input tokens: c (row A) or
-        d (row B), matching the staged replay tokens."""
-        col = 0 if is_row_a else 1
+    def _row_token_ids(self, reqs: List[Req], row_idx: int) -> torch.Tensor:
+        """[B] int32 host tensor of the row's input tokens: c (row 0) or
+        d_k (row k), matching the staged replay tokens."""
         return torch.tensor(
-            [req.input_ids[req.device_len - 2 + col].item() for req in reqs],
+            [req.input_ids[req.cached_len + row_idx].item() for req in reqs],
             dtype=torch.int32)
 
     def _mtp_replay_batch_meta(self, batch: Batch) -> Batch:
@@ -1272,7 +1287,7 @@ class Scheduler(SchedulerIOMixin):
 
 
 class _SpecRowPair:
-    """A 2-row view of a Req for the MTP replay's metadata build: the
+    """An (n+1)-row view of a Req for the MTP replay's metadata build: the
     full unprocessed span [cached_len, device_len) = the verify window."""
 
     def __init__(self, req: Req):
@@ -1288,7 +1303,7 @@ class _SpecRowPair:
 
     @property
     def extend_len(self) -> int:
-        return 2
+        return self._req.device_len - self._req.cached_len
 
     @property
     def table_idx(self) -> int:
@@ -1296,17 +1311,17 @@ class _SpecRowPair:
 
 
 class _SpecRowReq:
-    """A 1-row view of a Req for one verify row batch: the row's extend
-    window is [device_len - 2 + row_off, device_len - 1 + row_off), i.e.
-    row A processes position q = device_len-2, row B position q+1. The
-    row batch's bookkeeping (positions, out_loc, attention metadata) is
+    """A 1-row view of a Req for one verify row batch (row 0 = the
+    certain row, 1..n the draft rows): the row's extend window is
+    [q + row, q + row + 1) where q = the req's cached_len. The row
+    batch's bookkeeping (positions, out_loc, attention metadata) is
     derived from these properties without mutating the real req."""
 
-    def __init__(self, req: Req, row_off: int):
+    def __init__(self, req: Req, row: int):
         self._req = req
-        self._off = row_off
-        # the row-1 (row B) slot's device_len view:
-        self._dev = req.device_len - 1 + row_off
+        self._off = row
+        # the row's device_len view: one position past the row's token
+        self._dev = req.cached_len + 1 + row
 
     @property
     def cached_len(self) -> int:

@@ -446,7 +446,7 @@ class MTPDraftGraphRunner:
         rows, kernel geometry identical to the eager path's.
 
         ``draft_batch`` is the scheduler's row-A spec batch
-        (_make_spec_row_batch(is_row_a=True)): it supplies the req views
+        (_make_spec_row_batch(row_idx=0)): it supplies the req views
         whose device_len/table_idx feed the FI metadata plan and whose
         positions/out_loc this method stages into the static buffers. A
         fresh FIMetadata is built EVERY step (prepare_for_replay asserts

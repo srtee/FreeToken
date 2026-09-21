@@ -142,10 +142,12 @@ def main() -> None:
     # positions. The spec build keeps mr/cgmbs=MAX_BS for Gate 1's bs 1..4
     # bit-equality families, but generation drives ONE PROMPT AT A TIME
     # (bs=1 rows in both arms, M=1 GEMMs throughout).
+    depth = int(os.environ.get("SPEC_DRAFT_N", "1")) if spec else 1
     llm = LLM(model_path=CKPT, dtype=torch.bfloat16,
               attention_backend="auto",
               max_running_req=MAX_BS if spec else 1,
               spec_mtp=spec,
+              spec_draft_n=depth,
               cuda_graph_max_bs=MAX_BS if spec else 1,
               moe_strategy="offload", expert_load="parallel",
               kv_reserve_tokens=8192, moe_cache_auto=True)
@@ -154,9 +156,21 @@ def main() -> None:
     sp = SamplingParams(max_tokens=int(os.environ.get("GATE_TOKENS", 256)),
                         ignore_eos=True, **GREEDY)
     token_ids = []
+    import time
+    t0 = time.perf_counter()
     for prompt in PROMPTS:
         res = llm.generate([prompt], sp)
         token_ids.append(res[0]["token_ids"])
+    gen_secs = time.perf_counter() - t0
+    st = llm.engine.mtp_drafter.stats if spec else None
+    print(json.dumps({
+        "mode": mode, "depth": depth if spec else 0,
+        "gen_secs": round(gen_secs, 2),
+        "tokens": sum(len(t) for t in token_ids),
+        "spec_drafted": st.drafted if st else 0,
+        "spec_accepted": st.accepted if st else 0,
+        "accepted_at": list(st.accepted_at) if st else [],
+    }))
     print(json.dumps(token_ids))
     from freetoken.distributed import destroy_distributed
 

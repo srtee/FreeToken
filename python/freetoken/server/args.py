@@ -434,6 +434,15 @@ def parse_args(
         "byte-identical to plain decode.",
     )
     parser.add_argument(
+        "--spec-draft-n",
+        type=_positive_int,
+        default=ServerArgs.spec_draft_n,
+        help="Draft chain depth under --spec-mtp: 1 (depth-1, stage 3) or "
+        "2 (stage 4, --spec-draft-n 2). Depth n drafts n tokens per "
+        "iteration and verifies with n+1 sequential 1-row trunk forwards; "
+        "output stays byte-identical to plain greedy decode.",
+    )
+    parser.add_argument(
         "--kv-codec-tune",
         type=str,
         default=ServerArgs.kv_codec_tune,

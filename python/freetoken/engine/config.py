@@ -101,10 +101,17 @@ class EngineConfig:
     # MTP speculative decoding (Qwen3.5/3.6 checkpoints with an mtp.* head):
     # depth-1 greedy draft + verify, eager (forces CUDA-graph exclusion).
     spec_mtp: bool = False
+    # Draft chain depth under --spec-mtp: 1 (stage 3) or 2 (stage 4).
+    # The verify runs n+1 sequential 1-row batches per request either way;
+    # only the scheduler's advance span and the resolve grow with n.
+    spec_draft_n: int = 1
 
     def __post_init__(self):
         if self.kv_codec_tune != "none" and self.kv_codec == "f16":
             raise ValueError("--kv-codec-tune innerq requires a non-f16 --kv-codec")
+        if self.spec_mtp and not 1 <= self.spec_draft_n <= 2:
+            raise ValueError(
+                f"--spec-draft-n {self.spec_draft_n} unsupported: stage 4 gates depth 1-2")
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":

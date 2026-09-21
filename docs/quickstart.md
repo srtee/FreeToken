@@ -13,8 +13,9 @@ and MoE backends, cache sizes, tool-call and reasoning parsers — resolves from
 the checkpoint and the GPU; see [cli.md](cli.md) for the flags. The server is
 ready when the log reaches `API server is ready to serve on 127.0.0.1:1919`.
 MTP-capable checkpoints (Qwen3.5/3.6 with an `mtp.*` head) can add
-`--spec-mtp` for speculative decoding — depth-1 greedy draft + verify,
-both CUDA-graphed, greedy-lossless.
+`--spec-mtp` for speculative decoding — greedy draft + verify, both
+CUDA-graphed, greedy-lossless. `--spec-draft-n 2` chains two draft tokens
+per iteration (worth trying when per-position acceptance stays high).
 
 ## Send a request
 

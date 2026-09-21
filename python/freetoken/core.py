@@ -66,21 +66,24 @@ class Req:
     # --- MTP spec decode (wave 2, depth-1): per-request loop state. ---
     # Pending MTP carry: the trunk hidden (post-norm, [H]) the next draft
     # consumes. Set after prefill (= the prefill's last hidden row) and
-    # refreshed by every spec resolve (row B's hidden on accept, row A's on
-    # reject). None = draft is not armed for this req (degrade to plain
-    # decode — buun's not-ready draft skip, speculative.cpp:2960-2964).
+    # refreshed by every spec resolve (verify row k's hidden, k = the
+    # accept count). None = draft is not armed for this req (degrade to
+    # plain decode — buun's not-ready draft skip, speculative.cpp:2960-2964).
     spec_carry: "torch.Tensor | None" = None
     # Spec arm state for the NEXT decode batch: the number of leading
     # certain-row re-processes the verify forward must run BEFORE the
-    # drafted row. 0 = normal (rows [c@q, d@q+1]); after a reject the
-    # undone GDN state is re-derived by re-processing the undone position
-    # as row 0 of the next verify (1 leading row; 2+ only if several
-    # consecutive rejects stack — impossible at depth 1, kept general).
+    # drafted rows. 0 = normal (the n+1 fresh verify rows); after a reject
+    # at draft k the undone GDN state is re-derived by re-processing the
+    # undone position as row 0 of the next verify (1 leading row; 2+ only
+    # if several consecutive rejects stack — kept general).
     spec_undone: int = 0
     # Spec resolve staging (set by the engine's _build_spec_output, before
-    # the drain): the resolved next input token; whether this iteration
-    # accepted (the drain emits the bonus only on accept).
+    # the drain): the resolved next input token; how many drafts this
+    # iteration accepted (the drain emits the bonus only when > 0).
     spec_next_input: int | None = None
+    # how many drafts the last spec iteration accepted (0..spec_draft_n);
+    # spec_accepted stays the any-accept bool the telemetry reads.
+    spec_accept_count: int = 0
     spec_accepted: bool = False
     # Mapped-but-uncommitted page count: pages allocate_paged mapped for the
     # in-flight verify rows that the resolve has NOT yet committed (accept
@@ -190,21 +193,22 @@ class Batch:
     # None on every non-spec batch.
     spec_row_batches: "List[Batch] | None" = None
     spec_carry_gpu: "torch.Tensor | None" = None      # [B, H] GPU
-    spec_input_tokens_gpu: "torch.Tensor | None" = None  # [B] int32 GPU (row A tokens)
+    spec_input_tokens_gpu: "torch.Tensor | None" = None  # [B] int32 GPU (row 0 tokens)
     spec_replay_input_ids: "torch.Tensor | None" = None
     spec_replay_positions: "torch.Tensor | None" = None
     spec_replay_out_loc: "torch.Tensor | None" = None
     spec_replay_attn_metadata: "BaseAttnMetadata | None" = None
-    spec_next_input_gpu: "torch.Tensor | None" = None
-    # The MTP spec GDN-state snapshot per request: [B] pool slots holding
-    # the state AFTER verify row A (position q) — captured by the engine
-    # BETWEEN the row-A and row-B forwards (plan option (b): two
-    # sequential 1-row steps with a mid-snapshot; the state after row A is
-    # exactly what a reject's committed frontier [0, q+1) needs — the old
-    # pre-verify snapshot was one row stale vs cached_len and corrupted
-    # attention state under rejects). The scheduler stages each hybrid
-    # req's idle ping-pong slot; None for non-hybrid.
-    spec_gdn_snapshot_slots: "List[int] | None" = None
+    # The MTP spec GDN-state snapshots per request: one pool slot per
+    # snapshot row 0..n-1 — the state AFTER verify row k, exactly what a
+    # reject at draft k's committed frontier [0, q+k+1) needs (captured by
+    # the engine BETWEEN successive row forwards; the old pre-verify
+    # snapshot was one row stale vs cached_len and corrupted attention
+    # state under rejects). The scheduler stages each hybrid req's slot
+    # list: slot 0 is the req's idle ping-pong track, slots 1..n-1 are
+    # per-iteration allocs (mirrored in spec_gdn_extra_slots); None for
+    # non-hybrid.
+    spec_gdn_snapshot_slots: "List[List[int]] | None" = None
+    spec_gdn_extra_slots: "List[int] | None" = None
 
     @property
     def size(self) -> int:

@@ -23,15 +23,17 @@ hook cloning the decode batch's bookkeeping.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
-
 
 @dataclass
 class SpecStats:
     drafted: int = 0
     accepted: int = 0
+    # per-position accept counts (stage 4 telemetry): accepted_at[j] =
+    # how many drafts were accepted at chain position j in the window.
+    accepted_at: list = field(default_factory=list)
 
     @property
     def rate(self) -> float:
@@ -56,46 +58,77 @@ def verify_chain(target_argmaxes: torch.Tensor,
 
 @dataclass
 class PerReqStep:
-    """The per-request resolve outcome for one spec iteration (depth 1).
+    """The per-request resolve outcome for one spec iteration (any depth).
 
     Mirrors tests/engine/test_mtp_loop.py's IterationResult / the semantics
-    doc's pseudocode exactly:
-      accept (row-A argmax == draft): emit [draft, bonus]; next input =
-      bonus; carry = row-B hidden; no rollback.
-      reject: emit [row-A argmax]; next input = it; carry = row-A hidden;
-      roll back row B (free its page slot, rewind device_len, restore GDN).
+    doc's pseudocode exactly. Depth-1 is the k=0/k=1 special case.
+      k accepts (rows 0..k-1 argmax == their drafts): emit
+      [d_0, ..., d_{k-1}, bonus]; next input = bonus; carry = row k's
+      hidden; no rollback.
+      reject at draft k: emit [a_0, ..., a_k] (the trunk argmaxes up to
+      and including the mismatching row); next input = a_k; carry = row
+      k's hidden; roll back rows k+1..n (free their page slots, rewind
+      device_len, restore the mid-verify GDN snapshot).
     """
-    accepted: bool
-    draft_token: int           # the drafted token d (always present)
-    emitted: tuple[int, ...]   # (d, bonus) on accept, (a,) on reject
-    next_input: int            # bonus on accept, row-A argmax on reject
-    carry_row: int             # 1 (row B) on accept, 0 (row A) on reject
+    accepted: int             # count of accepted drafts k (0..depth); truthy iff k > 0
+    draft_token: int          # depth-1 alias: drafts[0] (always present)
+    drafts: tuple[int, ...]   # the offered draft chain (d_0..d_{n-1})
+    emitted: tuple[int, ...]  # (d_0..d_{k-1}, a_k): the certain emissions
+    next_input: int           # the trunk argmax the next iteration consumes
+    carry_row: int            # k: carry = the trunk hidden of verify row k
+
+
+def resolve_chain(row_argmaxes: Sequence[int], drafts: Sequence[int]) -> PerReqStep:
+    """Greedy chain resolve (pure logic, CPU-testable): accept the longest
+    prefix of drafts whose verify-row argmax matches; the mismatching
+    (or final) row's argmax is the certain token.
+
+    row_argmaxes: (n+1,) — verify row j's argmax predicts position j+1,
+        i.e. the trunk's opinion of draft j (and of the final position).
+    drafts: (n,) — the drafted tokens for positions 1..n.
+    """
+    drafts = tuple(drafts)
+    k = 0
+    while k < len(drafts) and row_argmaxes[k] == drafts[k]:
+        k += 1
+    return PerReqStep(
+        accepted=k, draft_token=drafts[0], drafts=drafts,
+        emitted=drafts[:k] + (row_argmaxes[k],),
+        next_input=row_argmaxes[k], carry_row=k)
 
 
 def resolve_step(row_a_argmax: int, row_b_argmax: int,
                  draft_token: int) -> PerReqStep:
-    """Depth-1 resolve (pure logic, CPU-testable): accept iff the verify
-    row-A argmax equals the draft."""
-    if row_a_argmax == draft_token:
-        return PerReqStep(
-            accepted=True, draft_token=draft_token,
-            emitted=(draft_token, row_b_argmax), next_input=row_b_argmax,
-            carry_row=1)
-    return PerReqStep(
-        accepted=False, draft_token=draft_token,
-        emitted=(row_a_argmax,), next_input=row_a_argmax, carry_row=0)
+    """Depth-1 resolve: accept iff the verify row-A argmax equals the
+    draft. Delegates to the general chain resolve."""
+    return resolve_chain((row_a_argmax, row_b_argmax), (draft_token,))
+
+
+def batch_resolve_chain(row_argmaxes: torch.Tensor,
+                        drafts: torch.Tensor) -> list[PerReqStep]:
+    """Batched chain resolve. row_argmaxes [B, n+1], drafts [B, n] int
+    tensors; returns one PerReqStep per request. Row n's argmax is
+    computed for every request (the verify forward yields it regardless);
+    it is only *meaningful* where k == n."""
+    rows = row_argmaxes.tolist()
+    ds = drafts.tolist()
+    return [resolve_chain(rows[i], ds[i]) for i in range(len(ds))]
 
 
 def batch_resolve(row_a_argmaxes: torch.Tensor, row_b_argmaxes: torch.Tensor,
                   drafts: torch.Tensor) -> list[PerReqStep]:
-    """Batched depth-1 resolve. [B] int tensors each; returns one
-    PerReqStep per request. Row-B argmax is computed for every request
-    (the verify forward yields it regardless); it is only *meaningful* on
-    the accept side."""
-    a = row_a_argmaxes.tolist()
-    b = row_b_argmaxes.tolist()
-    d = drafts.tolist()
-    return [resolve_step(a[i], b[i], d[i]) for i in range(len(a))]
+    """Batched depth-1 resolve. [B] int tensors each; delegates to the
+    general chain resolve with n=1."""
+    return batch_resolve_chain(
+        torch.stack([row_a_argmaxes, row_b_argmaxes], dim=1),
+        drafts.unsqueeze(1))
+
+def per_position_accepts(steps: Sequence[PerReqStep], depth: int) -> list[int]:
+    """Per-position accept counts over one spec iteration: result[j] =
+    how many requests accepted draft j (0-indexed), for the depth
+    offered drafts. The plan's per-position acceptance signal."""
+    return [sum(1 for s in steps if s.accepted > j) for j in range(depth)]
+
 
 @dataclass
 class SpecResult:

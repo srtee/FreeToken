@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import torch
 
-from freetoken.engine.spec_mtp import PerReqStep, batch_resolve, resolve_step
+from freetoken.engine.spec_mtp import (
+    PerReqStep, batch_resolve, batch_resolve_chain, per_position_accepts,
+    resolve_chain, resolve_step)
 
 
 def test_resolve_accept():
@@ -59,4 +61,68 @@ def test_batch_resolve_all_accept_emits_bonus_each():
 def test_resolve_step_type_shape():
     # the dataclass contract: exactly the fields the loop needs, no more
     fields = {f for f in PerReqStep.__dataclass_fields__}
-    assert fields == {"accepted", "draft_token", "emitted", "next_input", "carry_row"}
+    assert fields == {"accepted", "draft_token", "drafts", "emitted",
+                      "next_input", "carry_row"}
+
+
+def test_resolve_chain_depth2_all_accept():
+    # drafts [10,11,12]; every row argmax agrees; the final row's argmax
+    # (13) is the bonus token
+    s = resolve_chain((10, 11, 12, 13), (10, 11, 12))
+    assert s.accepted == 3
+    assert s.emitted == (10, 11, 12, 13)
+    assert s.next_input == 13
+    assert s.carry_row == 3           # the last verify row's hidden
+
+
+def test_resolve_chain_depth2_first_reject():
+    # d_0 matches; d_1 does not — the trunk's row-1 argmax (99) is the
+    # certain token, exactly one draft rolls back
+    s = resolve_chain((10, 99, 55, 13), (10, 11, 12))
+    assert s.accepted == 1
+    assert s.emitted == (10, 99)
+    assert s.next_input == 99
+    assert s.carry_row == 1
+
+
+def test_resolve_chain_depth2_reject_at_zero():
+    # d_0 mismatches immediately: emit [a_0] only; rows 1..2's argmaxes
+    # are computed by the forward but never consulted
+    s = resolve_chain((50, 99, 55, 13), (10, 11, 12))
+    assert s.accepted == 0
+    assert s.emitted == (50,)
+    assert s.next_input == 50
+    assert s.carry_row == 0
+
+
+def test_resolve_chain_depth2_mid_reject_rolls_back_tail():
+    s = resolve_chain((10, 11, 55, 13), (10, 11, 99))
+    assert s.accepted == 2
+    assert s.emitted == (10, 11, 55)
+    assert s.next_input == 55
+    assert s.carry_row == 2
+
+
+def test_batch_resolve_chain_depth2_mixed():
+    # three requests, accept counts 3 / 1 / 0 — resolves are independent
+    rows = torch.tensor([[10, 11, 12, 13],
+                         [20, 29, 30, 31],
+                         [30, 40, 50, 60]], dtype=torch.int32)
+    drafts = torch.tensor([[10, 11, 12],
+                           [20, 21, 22],
+                           [35, 36, 37]], dtype=torch.int32)
+    steps = batch_resolve_chain(rows, drafts)
+    assert [s.accepted for s in steps] == [3, 1, 0]
+    assert [s.emitted for s in steps] == [(10, 11, 12, 13), (20, 29), (30,)]
+    assert [s.next_input for s in steps] == [13, 29, 30]
+    assert [s.carry_row for s in steps] == [3, 1, 0]
+
+
+def test_per_position_accepts_depth2():
+    steps = [
+        resolve_chain((10, 11, 12, 13), (10, 11, 12)),  # k=3
+        resolve_chain((20, 29, 30, 31), (20, 21, 22)),  # k=1
+        resolve_chain((30, 40, 50, 60), (35, 36, 37)),  # k=0
+    ]
+    assert per_position_accepts(steps, depth=3) == [2, 1, 1]
+    assert per_position_accepts(steps, depth=1) == [2]
