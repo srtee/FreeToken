@@ -257,6 +257,16 @@ def create_kvcache_pool(
         )
 
     spec = kv_specs[0] if len(kv_specs) == 1 else None
+    # The MTP draft head's KV rows live at layer index num_layers (one per
+    # mtp layer) — the extended full-attn group's layer_ids include them, so
+    # the pool's global-id validation bound must cover them on BOTH pool
+    # paths. The bound is bookkeeping only: storage stays len(layer_ids).
+    n_pool_layers = max(
+        model_config.num_layers,
+        len(layer_ids) if layer_ids is not None else 0,
+        model_config.num_layers
+        + (getattr(model_config, "mtp_num_hidden_layers", 0) or 0),
+    )
     if kv_codec != "f16":
         from .turbo_pool import TurboKVCache
 
@@ -264,7 +274,7 @@ def create_kvcache_pool(
             num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
             num_pages=num_pages,
             page_size=page_size,
-            num_layers=model_config.num_layers,
+            num_layers=n_pool_layers,
             head_dim=spec.head_dim if spec is not None else model_config.head_dim,
             device=device,
             dtype=dtype,
@@ -274,21 +284,11 @@ def create_kvcache_pool(
         if kv_codec_tune == "innerq":
             pool.arm_innerq_calibration()
         return pool
-    # The MTP draft head's KV rows live at layer index num_layers (one per
-    # mtp layer) — the extended full-attn group's layer_ids include them,
-    # so the pool must size its storage to cover them.
-    n_pool_layers = model_config.num_layers + (
-        getattr(model_config, "mtp_num_hidden_layers", 0) or 0
-    )
     return MHAKVCache(
         num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
-        num_layers=max(
-            model_config.num_layers,
-            len(layer_ids) if layer_ids is not None else 0,
-            model_config.num_layers + (model_config.mtp_num_hidden_layers or 0),
-        ),
+        num_layers=n_pool_layers,
         head_dim=spec.head_dim if spec is not None else model_config.head_dim,
         device=device,
         dtype=dtype,
