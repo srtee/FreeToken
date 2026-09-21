@@ -59,6 +59,39 @@ deterministic, lengths identical across every turn (780/698/485 chars),
 zero drift/decay/loops. Prior soak failure attributed to the materializer
 page-id bug (fixed in 73f2bff).
 
+## Qwen3.6-35B-A3B (head_dim 256) — turbo3_tcq soak + cross-config matrix (2026-09-21)
+
+First soak of a head_dim-256 (dual rotation group) checkpoint. Findings:
+
+- **Pool economics**: turbo3_tcq @ 262144 tokens (the full model cap) costs
+  1.12 GiB — vs turbo8's 1.40 GiB @ 131072. Turbo3 doubles the addressable
+  context at half the KV footprint.
+- **Spec acceptance (quality canary)**: r = 0.57–0.90 per decode window,
+  aggregate ~0.75 — indistinguishable from turbo8 (0.65–0.92). The 3.25-bpv
+  TCQ storage does not degrade MTP draft quality on the 35B.
+- **Byte-stability**: NOT soak-passing in the strict sense — but the
+  investigation exonerated the codec. Greedy multi-turn soaks (3 prompts ×
+  10 turns, 512 tok) diverge identically on turbo8 and turbo3_tcq, with and
+  without --spec-mtp; concurrent duplicate requests are always identical.
+
+### The codec-independent first-reuse flip (open ticket)
+
+Config matrix (35B, same harness): turbo3+spec DIVERGED, turbo3 plain
+DIVERGED, turbo8 plain DIVERGED (cold server), turbo8 plain warm-tree
+STABLE, turbo8+spec (twice) STABLE. Pattern: exactly one turn-0 prompt
+flips EOS-boundary length (0 vs 8–25 tokens) between pass 1 (fresh-computed
+prefix, chunked prefill) and pass 2 (radix-cached prefix); all later turns
+and both cache-hot reruns of the same prompt are byte-identical. So the
+asymmetry is **fresh-vs-cached on the FIRST reuse only**, not codec
+quantization noise and not the spec path. Prime suspect: the hybrid-radix
+GDN snapshot donate/restore pair (`_build_track_metadata` ×64-boundary
+snapshot in `attention/linear.py`, `_cache_req_hybrid` donation,
+`_restore_linear_states` COW restore) — semantics read consistent under
+audit, so the next step is a stateprobe-style A/B (restored state vs
+recomputed state at an identical boundary). Masking hypothesis for the
+stable turbo8+spec cells: the spec arm re-verifies the first tokens after
+every restore (row A re-forward), hiding a stale-state first step.
+
 ## (historical) 30-min soak — RESOLVED (materializer page-id bug)
 
 **ROOT CAUSE FOUND AND FIXED** (commit after b72236f): `materialize()`
