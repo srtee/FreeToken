@@ -465,7 +465,12 @@ class MTPDraftGraphRunner:
             carries, tokens, draft_batch.out_loc, draft_batch.positions, bs)
         self.attn_backend.prepare_for_replay(draft_batch)
         g.replay()
-        return self.buffer.drafts[:bs], self.buffer.carry_out[:bs]
+        # COPIES, not views: a chained draft (depth-2) replays this graph
+        # again, overwriting the static slots an earlier step's return
+        # aliases -- callers stacking per-step results would read the
+        # last step's values in every column.
+        return (self.buffer.drafts[:bs].clone(),
+                self.buffer.carry_out[:bs].clone())
 
     # NOTE: must run before freeing NCCL resources (same contract as the trunk).
     def destroy_cuda_graphs(self) -> None:

@@ -71,7 +71,7 @@ def compare(tag: str, ref: list, spec: list, short: int, long: int = 0) -> int:
 def main() -> None:
     if len(sys.argv) > 1:
         mode = sys.argv[1]
-        cfg = dict(MODES)[mode]
+        cfg = {m: e for m, e, _ in MODES}[mode]
         out = run_worker(mode, cfg, dict((m, p) for m, _, p in MODES)[mode])
         print(json.dumps(out["tokens"][-1][:16]))
         return

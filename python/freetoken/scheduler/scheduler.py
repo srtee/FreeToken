@@ -1139,11 +1139,11 @@ class Scheduler(SchedulerIOMixin):
         # (_row_token_ids); building them earlier gathers the ids_buf's
         # uninitialized memory.
         mtp = eng.model.model.mtp
-        # The draft rides row 0's staging (positions q, out_loc = pt[q]):
-        # every chain step piles its KV row onto the SAME row-0 slot, and
-        # the verify's rows re-write the layer-(num_layers) table across
-        # [q, q+n] with deterministic content — all piled draft rows are
-        # overwritten before anything reads them.
+        # Step 0 of the chain rides row-0 staging; steps 1..n-1 stage at
+        # their own rows (built in the loop below): every chain step must
+        # write its layer-(num_layers) KV row at the slot its content
+        # belongs to, so the verify's replay overwrites it with the
+        # identical content instead of garbage.
         draft_batch = self._make_spec_row_batch(batch.reqs, row_idx=0)
         draft_batch.input_ids = input_tokens
         # Wave-2 stage 2: the draft rides the per-bs CUDA-graph family
@@ -1155,16 +1155,36 @@ class Scheduler(SchedulerIOMixin):
         use_graph = runner is not None and runner.can_draft(batch.size)
         draft_steps: list[torch.Tensor] = []
         tokens = input_tokens
-        for _ in range(n):
+        for k in range(n):
+            # Step k stages at ITS row (position q+k, out_loc pt[q+k]):
+            # the post-verify replay rewrites that row with the identical
+            # content f(d_{k-1} @ q+k, H_{k-1}). Piling every step onto
+            # row 0 (the depth-1 layout) let step 1 clobber pt[q] with
+            # f(d_0 @ q, H_q) — wrong token, wrong RoPE — and the replay's
+            # row-0 attention then read that garbage self-row and commit
+            # a corrupt layer-40 history that the NEXT iteration's draft
+            # attends: depth-2 acceptance collapse (stage-4 gate,
+            # 2026-09-21) with output staying lossless (the trunk never
+            # reads layer 40).
+            step_batch = (draft_batch if k == 0
+                          else self._make_spec_row_batch(batch.reqs, row_idx=k))
+            step_batch.input_ids = tokens
             if use_graph:
                 with torch.cuda.stream(eng.stream):
-                    d, carries = runner.draft(carries, tokens, draft_batch)
+                    d, carries = runner.draft(carries, tokens, step_batch)
             else:
                 with torch.cuda.stream(eng.stream):
-                    with eng.ctx.forward_batch(draft_batch):
+                    with eng.ctx.forward_batch(step_batch):
                         carries, logits = mtp.draft_step(carries, tokens)
                         d = logits.argmax(dim=-1).to(torch.int32)
             draft_steps.append(d)
+            if os.environ.get("FT_DEBUG_STORE"):
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[chain k={k}] tok={int(tokens[0].item())} "
+                    f"carry={float(carries[0].float().norm()):.4f} "
+                    f"d={[int(x) for x in d.tolist()]}\n")
+                _sys.stderr.flush()
             tokens = d
         batch.spec_drafts_gpu = torch.stack(draft_steps, dim=1)  # [B, n]
         for i, req in enumerate(batch.reqs):

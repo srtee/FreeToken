@@ -26,6 +26,8 @@ def bit_equality(eng) -> None:
 
 
     runner = eng.verify_graph_runner
+    if runner is None:  # FT_SPEC_DRAFT_EAGER probe: skip the bit gate
+        return
     assert runner is not None, "verify family required for the bit gate"
     mtp = eng.model.model.mtp
     pool = eng.linear_state_pool

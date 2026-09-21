@@ -1,10 +1,32 @@
 # Wave-2 Stage 4 — depth-2 draft chain: status & findings
 
-**As of 2026-09-21. STAGE 4 GATE: byte-identity ALL PASS; acceptance gate NOT
-met — depth 2 stays config-gated, default remains 1.** Losslessness (the hard
-gate): depth-2 output is byte-identical to plain AND to depth-1 on all three
-gate prompts. The acceptance-rate signal (plan §Verification: "lossless-but-
-quality-destroying" class) collapsed at depth 2 — open investigation below.
+**As of 2026-09-21. STAGE 4 GATE: ALL PASS** — losslessness byte-identical
+(depth 2 == plain == depth 1) AND the acceptance gate met after fixing the
+draft-graph view-clobber bug below (depth-2 acceptance 0.572, ≥ 0.55).
+Depth 2 still loses the perf decision at bs=1 on this box, so the default
+remains `--spec-draft-n 1`.
+
+## Root cause of the acceptance collapse (fixed)
+
+`MTPDraftGraphRunner.draft()` returned **views** into the static CUDA-graph
+buffers (`buffer.drafts[:bs]`). A chained draft replays the graph again,
+overwriting the slot an earlier step's return aliases: `torch.stack` of the
+per-step results then read the LAST step's draft in every column, so
+depth-2's staged draft pair was `[d1, d1]` instead of `[d0, d1]`. Verify is
+lossless regardless (rejects roll back), but position-0 acceptance collapsed
+to "the model repeats the token" (~2.5%). Depth 1 is unaffected — one step,
+consumed before any replay. The per-step bit-equality gate (depth-1,
+compared before the next replay) could never see it. Fix: `draft()` returns
+`.clone()`s. Diagnosis: eager-draft A/B (`FT_SPEC_DRAFT_EAGER=1`) chained
+correctly while the graphed path staged the wrong token into step 2 with
+IDENTICAL per-step carries — compute was right, only the stacked views were
+stale.
+
+En route, the draft chain's KV staging also moved from "every step piles
+onto row 0's slot/position q" (accidentally load-bearing at depth 1 —
+step 0's write IS row 0's content) to per-step staging at position q+k /
+slot pt[q+k], so every layer-40 row holds its own content before anything
+attends it.
 
 ## What landed
 
@@ -49,26 +71,32 @@ test failures), and `test_resolve_step_type_shape`'s field-set pin was stale.
 Depth 2 is a 2.6× throughput REGRESSION vs plain on this architecture (the
 verify is n+1 sequential 1-row trunk forwards; depth 2 needs ~3× the token
 yield just to break even, and measured acceptance makes that impossible).
-**Default stays `--spec-draft-n 1`.** Depth 1 is itself slower than plain on
-this short-window gate run (62.8 vs 83.5 tok/s over 256-token generations;
-3 trunk forwards per iteration need >2× yield; stage-3's longer-window numbers
-should be re-checked in the stage-5 soak).
+## Gate results (2026-09-21, 35B NVFP4, GATE_TOKENS=256, bs=1 greedy)
 
-## Open item: depth-2 acceptance collapse (blocks any depth-2 default)
+```
+GATE 2 (d1 == plain): byte-identical, 763 tokens
+GATE 1 (d2 == plain): byte-identical, 762 tokens
+GATE 3 (d2 == d1):    byte-identical, 762 tokens
 
-`accepted_at=[34, 2]` over ~750 iterations: position-0 acceptance ~4.5% at
-depth 2 vs ~43% at depth 1 — the SAME first-draft quantity (argmax of
-`draft(H@q+1, c@q)` verified by the trunk row predicting q+2), so the
-distributions should match. Output correctness is unaffected (all verify rows
-are trunk forwards; rejects roll back fully — hence the byte-identity PASS),
-but draft quality dies. Leading hypothesis: the MTP draft-layer KV rows of
-the chained drafts (positions q+1, q+2 at layer_id=num_layers) collide or go
-stale across rejects — after the first ~40 iterations (where the 34 accepts
-concentrate) every subsequent draft attends a polluted layer-40 history. This
-is exactly the plan's "layer-40 KV gap class": lossless but quality-
-destroying; the r ≥ 0.55 acceptance gate fired as designed.
+mode   depth   secs  tokens   tok/s    acc  acc@0  acc@1
+plain      0   8.80     765   86.9
+d1         1  12.24     763   62.3   0.75    328      0
+d2         2  13.83     762   55.1   0.57    260    147
 
-Next probe: `FT_SPEC_TRACE=1` iteration dump comparing the staged draft row
-positions/page slots per chain step against the mapped table; then a
-deterministic 2-iteration replaydiff (the stage-3 `mtp_stage3_replaydiff.py`
-pattern) with one forced reject between iterations.
+depth-2 acceptance: 0.572 (accepted_at=[260, 147])  — was [34, 2] pre-fix
+```
+
+Also fixed en route: `spec_mtp.py` had lost its `import torch` (9 pre-existing
+test failures), and `test_resolve_step_type_shape`'s field-set pin was stale.
+
+## Perf decision
+
+Depth 2 passes BOTH gates but is still a throughput regression vs plain at
+bs=1 on this architecture (55.1 vs 86.9 tok/s; the verify is n+1 sequential
+1-row trunk forwards, so depth 2 needs ~2.2× the token yield to break even
+and 0.57 acceptance yields ~1.55×). **Default stays `--spec-draft-n 1`.**
+Depth 1 is itself slower than plain on this short-window gate run (62.3 vs
+86.9 tok/s over 256-token generations; stage-3's longer-window economics
+should be re-checked in the stage-5 soak). The clone fix makes depth 2
+CORRECT — a viable flag for latency-sensitive long-generation workloads
+where per-iteration yield (≤ 3 tokens/iter) beats per-step overhead.
