@@ -71,6 +71,29 @@ split across ranks), quantization is per-128-group and never crosses heads, and
 InnerQ scales are per-rank — each rank calibrates from its own heads'
 statistics, which is correct since scales are decode-local.
 
+## GGUF checkpoints
+
+`ft serve --model <file>.gguf` loads GGUF files directly — config and tokenizer
+travel inside the file's metadata header, no HF repo needed. `ft checkpoint`
+also accepts a GGUF: the resulting FTW keeps a `source_metadata.gguf` sidecar
+so the config/tokenizer still resolve from the original header.
+
+| Family | Examples |
+|---|---|
+| llama / qwen2 (dense) | Qwen2.5-Coder-14B Q3_K_M |
+| qwen3-moe | Qwen3-30B-A3B GGUFs (three-tensor expert banks) |
+| qwen35moe | Qwen3.5/3.6-35B-A3B GGUFs — hybrid GDN layers, NVFP4-in-GGUF (llama.cpp extension with per-tensor `scale` sidecars) |
+| gemma4 | google/gemma-4 GGUF releases (fused `ffn_gate_up_exps`, Q4_0 experts) |
+
+Quant coverage: legacy Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 and all K-quants Q2_K–Q6_K run
+the packed-weight MMVQ/MMQ kernels (dequant-in-kernel; no bf16 weight copy is
+ever materialized). Mixed-quant files such as Q3_K_M (Q3_K attention + Q4_K/Q5_K
+FFN) dispatch per tensor. The `iq*` types are MMVQ/dequant-only: small batches
+use the vector kernel, larger batches fall back to dequant-then-matmul.
+
+Restriction: GGUF serving is TP=1 — packed quant rows and expert banks do not
+shard; TP>1 fails fast with a clear error.
+
 ## Notes
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
