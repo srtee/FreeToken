@@ -74,36 +74,51 @@ First soak of a head_dim-256 (dual rotation group) checkpoint. Findings:
   10 turns, 512 tok) diverge identically on turbo8 and turbo3_tcq, with and
   without --spec-mtp; concurrent duplicate requests are always identical.
 
-### The cold-first-request artifact — RESOLVED (2026-09-22); not a cache or codec bug
+### The first-reuse flip — root-caused (2026-09-22): greedy near-tie lottery, not a server bug
 
-The "first-reuse flip" was the **first HTTP request to a freshly started
-server returning an empty response**. It only correlated with cache reuse
-because in a cold soak pass-1 turn-0 IS request #1, and pass-2 turn-0 is the
-radix-hot reply (9 chars) to the same prompt.
+Final picture after a full day of controlled bisection. The signature — pass-2
+turn-0 differs from pass-1 turn-0 (0 vs 9 content chars) while turns 1–9 are
+byte-stable — is **greedy sampling flipping one near-tie token** when the
+compute path changes, not state corruption anywhere in the stack. The "0
+chars" side is the thinking model burning the whole 512-token budget on
+reasoning; a flipped early token changes whether reasoning terminates in
+budget (9 chars) or not (0 chars).
 
-Evidence trail:
-1. fp32 snapshot hardening (this commit): h_track boundary snapshots are now
-   bit-exact vs the kernel's internal fp32 registers
-   (`tests/kernels/test_fla_track_snapshot_fp32.py`). The flip persisted with
-   the IDENTICAL signature `[[0,0,0,9]]` — the bf16-rounded-`h` theory is dead,
-   and the hardening stands as correctness work.
-2. Post-fix turbo8 plain cold soak: same `[[0,0,0,9]]`. 8-bit quant noise
-   cannot flip a greedy tie identically to 3-bit — refutes quantization
-   noise and, being deterministic, any noise model at all.
-3. Decisive control: cold restart, one trivial warmup ping before the soak.
-   The warmup returned **empty text** (0 chars on a "Say OK" prompt); the
-   subsequent 10-turn × 3-prompt turbo3-plain soak was byte-STABLE
-   (2026-09-22, `/tmp/soak_t3_after.json` run with warmup).
+Eliminated, each with a decisive experiment:
+1. **bf16-rounded snapshot state**: dead — the fp32 `h_track` hardening kept
+   the IDENTICAL signature (`test_fla_track_snapshot_fp32.py` proves
+   snapshot == kernel registers bit-exact).
+2. **KV codec quant noise**: dead — the flip reproduced on f16 KV (lossless
+   pages) with the same signature; and identical flips across turbo3/turbo8
+   refute any noise model.
+3. **GDN resume math**: dead — kernel probes (`/tmp` resume_probe) show
+   two-stage resume seeded from the fp32 boundary state is **bit-exact** vs
+   the continuous chain (fp32 pools); server-side, a cold-vs-resume A/B with
+   the real 9-token tail produced identical 511-token outputs.
+4. **Triton autotune benchmark corruption**: dead — the GDN `fwd_h` kernel is
+   single-config by design (in-place state write), and no multi-config +
+   in-place kernel exists on either path. (The "cold autotune wrong numerics"
+   scare was an editable-install artifact: a HEAD worktree run importing the
+   main tree's mid-repair code. Final tree: 504 passed, cold caches.)
+5. **Radix resume path**: exonerated as corruption — `--cache-type naive`
+   (no resume at all) is byte-stable, but so is radix once kernel configs
+   settled (below). Resume restores exact state; it only changes kernel
+   shapes (9-token tail re-prefill vs full prefill).
 
-This also reconciles the old matrix: every DIVERGED cell ran with a cold
-server (request #1 inside the soak); every STABLE cell (warm-tree, cache-hot
-rerun) had a warm first request.
+Mechanism: kernel-config-dependent rounding. Attention/MoE/GEMM tile configs
+key on batch shapes; a resume-tail prefill selects different tiling than the
+full prefill → ~1e-7 logit deltas → one greedy argmax flips on a prompt that
+sits on a top-2 razor edge. Same class as the known concurrent-batch
+nondeterminism (`concurrent_pair_identical: false` on some boots). Boot-level
+correlation with the persisted triton autotune cache: after the day's 504-test
+sweep repopulated config winners, radix soaks went byte-stable on consecutive
+boots (manual resume probe + full soak + naive all stable, 2026-09-22
+afternoon) with zero source changes to the path. Greedy cross-path bit-equality
+is not a contract any serving engine holds — production runs temperature=1.0.
 
-Follow-up ticket (separate, pre-existing): first request after server start
-completes with 0 generated tokens and no error — suspected cold triton
-autotune path dropping the response. One empty reply per restart until fixed.
-
-## (historical) 30-min soak — RESOLVED (materializer page-id bug)
+Ticket closed as WORKING-AS-DESIGNED (documented). Actionable residue: none
+in the engine; harness-side, greedy multi-turn soaks should pin the autotune
+cache state (or run one config-warming pass) before comparing passes.
 
 ## (historical) 30-min soak — RESOLVED (materializer page-id bug)
 
