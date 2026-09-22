@@ -767,8 +767,7 @@ class Engine:
             device=self.device,
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
-            # FIXME: the None branch serves GGUF q4_0 banks, which have no quant method yet; drop it once GGUF joins the quant path
-            fmt=sample.quant_method.cpu_format if sample.quant_method is not None else None,
+            fmt=sample.quant_method.cpu_format,
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
@@ -1708,8 +1707,7 @@ def _adjust_ftw_quant_backend(model_path: str, quant_backend: QuantBackend) -> Q
 
 
 def shared_offload_method(model):
-    """The expert method every offload MoE layer of ``model`` uses, or None for models whose MoE layers carry none (GGUF).
-
+    """The expert method every offload MoE layer of ``model`` uses; None only when the layers carry no quant method at all (plain bf16 experts).
     The offload cache holds one bank layout, so the layers must agree on (kind, kernel)."""
     layers = [l for l in iter_offload_moe_layers(model) if getattr(l, "quant_method", None) is not None]
     if not layers:

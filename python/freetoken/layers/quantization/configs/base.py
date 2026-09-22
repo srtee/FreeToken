@@ -15,6 +15,25 @@ from ..scheme import QuantKind, QuantScheme
 LAYER_CONFIGS = {LayerKind.LINEAR: LinearConfig, LayerKind.MOE: MoEConfig}
 
 
+# Expert formats that arrive pre-quantized with no checkpoint quantization_config
+# (ModelConfig.expert_quant): the format tag maps to the method whose kernel owns
+# the bank layout. Built alongside get_quant_method so both selection seams agree.
+_FORMAT_TAG_KINDS = {"q4_0": QuantKind.Q4_0}
+
+
+def format_expert_method(format_tag: str | None, layer: Any):
+    """The Method for an offload layer whose experts are the tagged pre-quantized
+    format (the GGUF q4_0 blocks); ``None`` for a tag without a Method -- those
+    layers keep dispatching on the cache's format tag (today the GGUF nvfp4
+    provider banks and their dedicated branch)."""
+    kind = _FORMAT_TAG_KINDS.get(format_tag)
+    if kind is None:
+        return None
+    cls = method_class(kind, LayerKind.MOE)
+    cfg = LAYER_CONFIGS[LayerKind.MOE].from_layer(layer, None)
+    return cls(cfg, get_quant_backend().select(LayerKind.MOE, kind))
+
+
 def cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
     if cfg is None:
         return default

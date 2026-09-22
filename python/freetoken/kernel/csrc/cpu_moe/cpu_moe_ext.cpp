@@ -1139,6 +1139,29 @@ float q4_0_dot_i8_scalar(const uint8_t* w, const int8_t* aq, const float* asb, i
   return acc;
 }
 
+// Q4_1 flavor for the DOWN bank: ggml blocks are [d:fp16][m:fp16][16B nibbles] (20B/32)
+// and decode w = d*q + m with raw q in [0,15]. Same W4A8 contract; the block sum picks up
+// the m * sum(activation) term (activations = aq * asb[b] dequantized per block).
+float q4_1_dot_i8_scalar(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  float acc = 0.0f;
+  const int nb = K / 32;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 20;
+    uint16_t dh, mh;
+    std::memcpy(&dh, blk, sizeof(dh));
+    std::memcpy(&mh, blk + 2, sizeof(mh));
+    const uint8_t* q = blk + 4;  // 16 nibble bytes
+    const int8_t* a = aq + (size_t)b * 32;
+    int isum = 0, isuma = 0;
+    for (int j = 0; j < 16; ++j) {
+      isum += ((int)(q[j] & 0x0F)) * (int)a[j] + ((int)(q[j] >> 4)) * (int)a[16 + j];
+      isuma += (int)a[j] + (int)a[16 + j];
+    }
+    acc += (fp16_to_f32(dh) * (float)isum + fp16_to_f32(mh) * (float)isuma) * asb[b];
+  }
+  return acc;
+}
+
 #if CPU_MOE_X86
 // fp16 block scale -> fp32 via HW F16C (single value in lane 0).
 __attribute__((target("f16c")))
@@ -1205,7 +1228,74 @@ float q4_0_dot_i8_vnni(const uint8_t* w, const int8_t* aq, const float* asb, int
   }
   return hsum256(accF);
 }
+
+// Q4_1 down variants (see q4_1_dot_i8_scalar). The unsigned operand slots of
+// VPMADDUBSW / VPDPBUSD take the RAW nibbles q in [0,15] (no -8 shift); the m term
+// reuses the same activations through a 1*a unsigned multiply.
+__attribute__((target("avx2,fma,f16c")))
+float q4_1_dot_i8_avx2(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  const __m128i mask = _mm_set1_epi8(0x0F);
+  const __m256i ones8 = _mm256_set1_epi8(1);
+  const __m256i ones16 = _mm256_set1_epi16(1);
+  __m256 accF = _mm256_setzero_ps();
+  const int nb = K / 32;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 20;
+    _mm_prefetch(reinterpret_cast<const char*>(blk) + 512, _MM_HINT_T0);
+    uint16_t dh, mh;
+    std::memcpy(&dh, blk, sizeof(dh));
+    std::memcpy(&mh, blk + 2, sizeof(mh));
+    const __m128i qb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 4));
+    const __m128i lo = _mm_and_si128(qb, mask);
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(qb, 4), mask);
+    const __m256i q = _mm256_set_m128i(hi, lo);  // RAW nibbles, unsigned
+    __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(aq + (size_t)b * 32));
+    __m256i d32 = _mm256_madd_epi16(_mm256_maddubs_epi16(q, a), ones16);   // sum q*a
+    __m256i s32 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, a), ones16);  // sum a
+    float sb = asb[b];
+    accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d32), _mm256_set1_ps(q4_scale(dh) * sb), accF);
+    accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s32), _mm256_set1_ps(q4_scale(mh) * sb), accF);
+  }
+  return hsum256(accF);
+}
+
+__attribute__((target("avx2,avxvnni,fma,f16c")))
+float q4_1_dot_i8_vnni(const uint8_t* w, const int8_t* aq, const float* asb, int K) {
+  const __m128i mask = _mm_set1_epi8(0x0F);
+  const __m256i ones8 = _mm256_set1_epi8(1);
+  const __m256i zero = _mm256_setzero_si256();
+  __m256 accF = _mm256_setzero_ps();
+  const int nb = K / 32;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* blk = w + (size_t)b * 20;
+    _mm_prefetch(reinterpret_cast<const char*>(blk) + 512, _MM_HINT_T0);
+    uint16_t dh, mh;
+    std::memcpy(&dh, blk, sizeof(dh));
+    std::memcpy(&mh, blk + 2, sizeof(mh));
+    const __m128i qb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 4));
+    const __m128i lo = _mm_and_si128(qb, mask);
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(qb, 4), mask);
+    const __m256i q = _mm256_set_m128i(hi, lo);
+    __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(aq + (size_t)b * 32));
+    __m256i d32 = _mm256_dpbusd_avx_epi32(zero, q, a);      // sum q*a per lane
+    __m256i s32 = _mm256_dpbusd_avx_epi32(zero, ones8, a);  // sum a per lane
+    float sb = asb[b];
+    accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d32), _mm256_set1_ps(q4_scale(dh) * sb), accF);
+    accF = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s32), _mm256_set1_ps(q4_scale(mh) * sb), accF);
+  }
+  return hsum256(accF);
+}
 #endif  // CPU_MOE_X86
+
+q4dot_fn select_q4dot_dn() {
+  const IsaTier t = pick_isa();
+#if CPU_MOE_X86
+  if (cpu_has_avxvnni()) return q4_1_dot_i8_vnni;
+  if (t >= ISA_AVX2) return q4_1_dot_i8_avx2;
+#endif
+  (void)t;
+  return q4_1_dot_i8_scalar;
+}
 
 // All tiers are W4A8 (int8 activations pre-quantized to Q8_0). AVX-VNNI is orthogonal to
 // the ISA tier (gated by cpu_has_avxvnni() / FREETOKEN_CPU_MOE_NO_VNNI), so it wins when
@@ -1260,6 +1350,8 @@ struct CpuMoeExecutor {
   dsdot_fn dsdot;
   mxgemv_fn mxgemv;
   q4dot_fn q4dot;
+  q4dot_fn q4dot_dn = nullptr;  // WF_Q4_0 + Q4_1 down bank (see gemm2_dot)
+  bool down_q4_1 = false;       // down rows are 20-byte Q4_1 blocks (GGUF providers normalize)
   // ds_fp4: the caller already FP8-round-tripped the input activations on the GPU
   // (same reference grid), so submit() must not repeat it on the host-callback
   // thread. That scalar per-element pass is single-threaded ON THE DECODE CRITICAL
@@ -1351,7 +1443,7 @@ struct CpuMoeExecutor {
 
   CpuMoeExecutor(int num_threads_, int num_layers_, int num_experts_, int top_k_,
                  int hidden_size, int inter_size, int max_tokens, int activation_id,
-                 int apply_router_weight_on_input, int weight_format,
+                 int apply_router_weight_on_input, int weight_format, int down_q4_1_,
                  uintptr_t gate_up_ptr, uintptr_t down_ptr, uintptr_t gate_up_scale_ptr,
                  uintptr_t gate_up_global_ptr, uintptr_t down_scale_ptr,
                  uintptr_t down_global_ptr, uintptr_t gate_up_bias_ptr,
@@ -1366,6 +1458,7 @@ struct CpuMoeExecutor {
         act(activation_id),
         apply_on_input(apply_router_weight_on_input),
         fmt(weight_format),
+        down_q4_1(down_q4_1_ != 0),
         gate_up_tbl(reinterpret_cast<const uint64_t*>(gate_up_ptr)),
         down_tbl(reinterpret_cast<const uint64_t*>(down_ptr)),
         gu_scale_tbl(reinterpret_cast<const uint64_t*>(gate_up_scale_ptr)),
@@ -1383,11 +1476,12 @@ struct CpuMoeExecutor {
     dsdot = select_dsdot();
     mxgemv = select_mxgemv();
     q4dot = select_q4dot();
+    q4dot_dn = select_q4dot_dn();
     if (weight_format == WF_Q4_0) {
       if (H % 32 != 0 || I % 32 != 0)
         throw std::runtime_error("Q4_0 CPU MoE requires H and I to be multiples of 32");
       q4_gu_row_bytes = (H / 32) * 18;  // K = H (gate_up rows)
-      q4_dn_row_bytes = (I / 32) * 18;  // K = I (down rows)
+      q4_dn_row_bytes = (I / 32) * (down_q4_1 ? 20 : 18);  // K = I (down rows)
     }
     isa = c.name;
     // nvfp4 (AVX-VNNI only): W4A8 int8 decode when the CPU supports it. q4_0 is always
@@ -1514,7 +1608,7 @@ struct CpuMoeExecutor {
     }
     if (fmt == WF_Q4_0) {
       const uint8_t* w = dn_packed_l + ((size_t)e * H + row) * (size_t)q4_dn_row_bytes;
-      return q4dot(w, gi8, gas, I);  // W4A8: int8 activations (Q8_0), scale in gas
+      return down_q4_1 ? q4dot_dn(w, gi8, gas, I) : q4dot(w, gi8, gas, I);
     }
     const size_t r = (size_t)e * H + row;
     if (use_vnni)
@@ -2114,13 +2208,14 @@ struct CpuMoeExecutor {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   namespace py = pybind11;
   py::class_<CpuMoeExecutor>(m, "CpuMoeExecutor")
-      .def(py::init<int, int, int, int, int, int, int, int, int, int, uintptr_t, uintptr_t,
+      .def(py::init<int, int, int, int, int, int, int, int, int, int, int, uintptr_t, uintptr_t,
                     uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
                     double, double, std::vector<int>>(),
            py::arg("num_threads"), py::arg("num_layers"), py::arg("num_experts"),
            py::arg("top_k"), py::arg("hidden_size"), py::arg("inter_size"),
            py::arg("max_tokens"), py::arg("activation_id"),
            py::arg("apply_router_weight_on_input"), py::arg("weight_format"),
+           py::arg("down_q4_1"),
            py::arg("gate_up_ptr"), py::arg("down_ptr"), py::arg("gate_up_scale_ptr"),
            py::arg("gate_up_global_ptr"), py::arg("down_scale_ptr"),
            py::arg("down_global_ptr"), py::arg("gate_up_bias_ptr"),

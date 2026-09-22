@@ -9,8 +9,10 @@ use their own providers until they get a method.
 from __future__ import annotations
 
 import glob
+import json
 import math
 import os
+import shutil
 from dataclasses import dataclass, field
 
 import torch
@@ -279,6 +281,151 @@ def ftw_bank_bytes(model_path: str) -> int | None:
     return sum(t["nbytes"] for t in tensors if t.get("kind") == "experts_bank")
 
 
+# ---------------------------------------------------------------------------
+# Expert-bank disk cache: a config-keyed banks-only FTW dir that lets a restart
+# skip the slow-path rebuild (re-reading + repacking the whole checkpoint every
+# boot). The cache dir name keys on everything that changes bank bytes: the
+# resolved format, the packing (kind, kernel, decode_target), the storage dtype,
+# the layer/expert geometry and the source shards' (name, size, mtime_ns)
+# fingerprints. The fingerprint dict itself is stored in the FTW index meta and
+# compared verbatim on read; any drift is a miss (and the next store overwrites).
+# FREETOKEN_BANK_CACHE: unset -> <model_path>/freetoken_banks; a path overrides
+# the root; "off"/"0" disables. Dummy banks and the converter (layer_sink) never
+# touch it.
+_BANK_CACHE_VERSION = 1
+
+
+def _bank_cache_root(model_path: str) -> str | None:
+    env = os.environ.get("FREETOKEN_BANK_CACHE")
+    if env is not None:
+        if env.strip().lower() in ("off", "0", "false"):
+            return None
+        return env
+    # model_path may be a bare checkpoint file (native GGUF); cache next to it.
+    base = model_path if os.path.isdir(model_path) else os.path.dirname(model_path)
+    if not base:
+        return None
+    return os.path.join(base, "freetoken_banks")
+
+
+def _resolve_bank_format(model_config, method) -> str:
+    """The ``ExpertBanks.quant_format`` the slow path would build, from the same
+    branch ``_build`` takes (format-tag GGUF providers even when a method exists)."""
+    if method is None or getattr(model_config, "weight_format", None) == "gguf":
+        return model_config.expert_quant  # a provider tag; unknown tags raise in _legacy_expert_banks
+    from .legacy_format import legacy_format_for
+
+    return legacy_format_for(method.kind, method.kernel.name)
+
+
+def _bank_cache_sources(model_path: str) -> list:
+    """(name, size, mtime_ns) of every weight file plus the shard index's hash."""
+    import hashlib
+
+    rows = []
+    for name in sorted(
+        os.path.basename(p)
+        for pat in ("*.safetensors", "*.gguf")
+        for p in glob.glob(os.path.join(model_path, pat))
+    ):
+        st = os.stat(os.path.join(model_path, name))
+        rows.append([name, st.st_size, st.st_mtime_ns])
+    index = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.isfile(index):
+        with open(index, "rb") as f:
+            rows.append(["model.safetensors.index.json", hashlib.sha256(f.read()).hexdigest(), 0])
+    return rows
+
+
+def _bank_cache_fingerprint(model_path, model_config, method, decode_target: str, dtype: torch.dtype) -> dict:
+    mc = model_config
+    return {
+        "v": _BANK_CACHE_VERSION,
+        "format": _resolve_bank_format(model_config, method),
+        "kind": str(method.kind) if method is not None else None,
+        "kernel": method.kernel.name if method is not None else None,
+        "decode_target": decode_target,
+        "dtype": str(dtype).replace("torch.", ""),
+        "num_layers": mc.num_moe_layers,
+        "num_experts": mc.num_experts,
+        "hidden": mc.hidden_size,
+        "moe_intermediate": getattr(mc, "moe_intermediate_size", None),
+        "sources": _bank_cache_sources(model_path),
+    }
+
+
+def _bank_cache_key(fp: dict) -> str:
+    import hashlib
+    import json
+
+    blob = json.dumps(fp, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def _load_bank_cache(cache_dir: str | None, fp: dict, method, num_layers: int, workers: int, chunk: int, layer_residency):
+    """The cached ``ExpertBanks`` for ``fp``, restoring the fields ``load_ftw_banks``
+    cannot reconstruct (legacy-provider quant_format, per-bank ggml types, layout);
+    ``None`` on a miss, a stale fingerprint, or an unreadable cache."""
+    from freetoken.checkpoint.ftw import INDEX_NAME, is_ftw_checkpoint, load_ftw_banks
+
+    if not (cache_dir and is_ftw_checkpoint(cache_dir)):
+        return None
+    try:
+        with open(os.path.join(cache_dir, INDEX_NAME)) as f:
+            stored = json.load(f).get("bank_cache")
+        if stored is None or {k: v for k, v in stored.items() if k != "ggml_types"} != fp:
+            logger.info_rank0(f"expert banks: disk cache stale ({cache_dir})")
+            return None
+        banks = load_ftw_banks(
+            cache_dir, num_layers=num_layers, workers=workers, chunk=chunk,
+            layer_residency=layer_residency,
+        )
+    except (OSError, ValueError, KeyError, AssertionError) as exc:
+        logger.warning_rank0(f"expert banks: disk cache unreadable ({exc!r}); rebuilding")
+        return None
+    if banks is None:
+        return None
+    object.__setattr__(banks, "quant_format", fp["format"])
+    if stored.get("ggml_types"):
+        object.__setattr__(banks, "ggml_types", stored["ggml_types"])
+    if method is not None and banks.layout is None:
+        object.__setattr__(banks, "layout", method.layout())
+    logger.info_rank0(f"expert banks: disk cache hit ({cache_dir})")
+    return banks
+
+
+def _store_bank_cache(cache_dir: str | None, fp: dict, banks: ExpertBanks, num_layers: int) -> None:
+    from freetoken.checkpoint.ftw import FTWWriter, layer_bank_entry_name
+
+    if not cache_dir:
+        return
+    tmp = f"{cache_dir}.tmp-{os.getpid()}"
+    try:
+        os.makedirs(os.path.dirname(cache_dir), exist_ok=True)
+        writer = FTWWriter(tmp)
+        for role, per_layer in banks.sources.items():
+            for i, tensor in enumerate(per_layer):
+                writer.add_tensor(layer_bank_entry_name(role, i), tensor, kind="experts_bank")
+        for name in ("gate_up_alpha", "down_alpha"):
+            alpha = getattr(banks, name, None)
+            if alpha is not None:
+                writer.add_tensor(name, alpha, kind="experts_bank")
+        writer.finalize({
+            # a legacy-format name keeps load_ftw_banks' kind_kernel_for round-trip
+            # happy; provider formats (q4_0 / GGUF nvfp4) stay None there and are
+            # restored from the fingerprint instead
+            "quant_format": banks.quant_format if banks.kernel is not None else None,
+            "expert_bank_num_layers": num_layers,
+            "bank_cache": {**fp, "ggml_types": banks.ggml_types},
+        })
+        os.rename(tmp, cache_dir)  # atomic; a concurrent starter's rename wins and ours fails below
+        logger.info_rank0(f"expert banks: wrote disk cache {cache_dir}")
+    except OSError as exc:
+        logger.warning_rank0(f"expert banks: disk cache store failed ({exc!r})")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def bank_bytes_estimate(model_config, method=None) -> int | None:
     """Estimated total expert-bank bytes of a raw checkpoint before loading it.
 
@@ -356,6 +503,21 @@ def load_expert_banks(
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
             return banks
 
+    # Disk cache (slow-path rebuilds only): read before the build, store after it.
+    # Dummy banks are random and the converter streams banks away -- neither is cacheable.
+    cache_dir = None
+    cache_fp = None
+    if model_path and not dummy and layer_sink is None:
+        try:
+            cache_fp = _bank_cache_fingerprint(model_path, model_config, method, decode_target, dtype)
+            cache_dir = os.path.join(_bank_cache_root(model_path), _bank_cache_key(cache_fp))
+        except OSError:
+            cache_fp = None  # unstattable / unreadable model dir: skip the cache silently
+    if cache_dir is not None:
+        banks = _load_bank_cache(cache_dir, cache_fp, method, model_config.num_moe_layers, workers, chunk, layer_residency)
+        if banks is not None:
+            return banks
+
     if parallel and not _PARALLEL_READER_SUPPORTED:
         logger.warning_rank0(
             "expert banks: parallel O_DIRECT reader unsupported on this platform "
@@ -387,9 +549,14 @@ def load_expert_banks(
     from freetoken.moe.host_banks import requested_residency
 
     def _build(par: bool) -> ExpertBanks:
-        if method is not None:
-            return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink)
-        return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink)
+        # Format-tag checkpoints (native GGUF providers: their banks come from
+        # load_q4_0_moe_expert_sources / the nvfp4 gguf reader, not the generic
+        # piece stream) keep the legacy readers even though make_moe_layer
+        # binds their quant method for the cache/executor wiring.
+        format_tag = getattr(model_config, "weight_format", None)
+        if method is None or format_tag == "gguf":
+            return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink)
+        return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink)
 
     with requested_residency(layer_residency) as residency_plan:
         try:
@@ -399,7 +566,10 @@ def load_expert_banks(
                 raise
             logger.warning_rank0(f"parallel reader unavailable ({exc}); falling back to serial build")
             banks = _build(False)
-    return _echo_residency(banks, layer_residency, residency_plan)
+    banks = _echo_residency(banks, layer_residency, residency_plan)
+    if cache_dir is not None and not banks.streamed:
+        _store_bank_cache(cache_dir, cache_fp, banks, model_config.num_moe_layers)
+    return banks
 
 
 def _echo_residency(banks: ExpertBanks, requested, plan) -> ExpertBanks:

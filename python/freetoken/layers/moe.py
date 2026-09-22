@@ -10,7 +10,7 @@ from freetoken.moe.offload_cache import OffloadMoeCache
 
 
 from .base import BaseOP
-from .quantization import ExpertView, LayerKind, QuantConfig, quant_method_for
+from .quantization import ExpertView, LayerKind, QuantConfig, format_expert_method, quant_method_for
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -81,7 +81,8 @@ class MoELayer(BaseOP):
         self.strategy = strategy
         self.decode_target = decode_target
         self.prefix = prefix
-        # offload layers without a quant config stay on the format-tag banks (GGUF q4_0)
+        # offload layers without a quant config stay None until make_moe_layer
+        # binds the format-tag method (GGUF q4_0 / nvfp4 provider banks)
         self.quant_method = None
         if quant_config is not None or allocate_experts:
             self.quant_method = quant_method_for(quant_config, self, prefix)
@@ -391,7 +392,8 @@ class OffloadMoELayer(MoELayer):
 
     # ------------------------------------------------------------------
     # Kernel dispatch: ``views`` are the bank tensors the movement step produced (in bank registration order) and ``topk_ids`` already index their rows.
-    # GGUF q4_0 experts still dispatch on the cache's format tag until they get a method.
+    # GGUF NVFP4 experts (qwen35moe adapter) still dispatch on the cache's
+    # format tag; q4_0 and every native quantized format carry a method now.
     # ------------------------------------------------------------------
 
     def _expert_gemm(
@@ -416,17 +418,9 @@ class OffloadMoELayer(MoELayer):
             return self.quant_method.apply(
                 hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill
             )
+        # Only the GGUF NVFP4 banks arrive without a method: their provider
+        # layout predates the method seam and the tag branch below is unchanged.
         fmt = cache.quant_format
-        if fmt == "q4_0":
-            # Native GGUF Q4_0 experts: dequant-in-kernel grouped GEMV (MMVQ) over the
-            # streamed packed banks; topk_ids already index the cache slots / layer.
-            from freetoken.moe.fused_q4_0 import fused_experts_gguf_q4_0
-
-            gate_up, down = views
-            return fused_experts_gguf_q4_0(
-                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
-                down_qt=(cache.ggml_types or {}).get("down"),
-            )
         if fmt == "nvfp4":
             # GGUF NVFP4 experts (qwen35moe adapter): the banks already use the
             # native ModelOpt row layout, so run the same Triton kernels the
@@ -457,7 +451,7 @@ class OffloadMoELayer(MoELayer):
                 hidden_states, *banks, topk_weights, topk_ids,
                 self.activation, self.apply_router_weight_on_input,
             )
-        raise AssertionError(f"offload experts without a quant method only serve q4_0/nvfp4 banks, got {fmt!r}")
+        raise AssertionError(f"offload experts without a quant method only serve the GGUF NVFP4 provider banks, got {fmt!r}")
 
 
 def make_moe_layer(
@@ -514,4 +508,10 @@ def make_moe_layer(
         kwargs["layer_id"] = layer_id
         kwargs["strategy"] = config.moe_strategy
         kwargs["decode_target"] = config.decode_target
-    return layer_cls(**kwargs)
+    layer = layer_cls(**kwargs)
+    if offload and layer.quant_method is None:
+        # format-tag experts (ModelConfig.expert_quant: the GGUF q4_0 blocks)
+        # have no checkpoint quantization_config; bind the format's method so
+        # every offload path treats them like any other quantized format
+        layer.quant_method = format_expert_method(config.expert_quant, layer)
+    return layer

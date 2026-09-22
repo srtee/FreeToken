@@ -21,6 +21,7 @@ from .moe import (
     Mxfp4MoEMethod,
     Mxfp8MoEMethod,
     Nvfp4MoEMethod,
+    Q4_0MoEMethod,
     UnquantizedMoEMethod,
 )
 from .quant_backend import QuantBackend, get_quant_backend, set_quant_backend
@@ -33,6 +34,7 @@ from .configs import (
     NoQuantConfig,
     QuantConfig,
     quant_method_for,
+    format_expert_method,
     quantization_config_of,
 )
 
@@ -43,8 +45,8 @@ __all__ = [
     "LinearConfig", "LinearKernel", "LinearMethod",
     "UnquantizedLinearMethod", "Fp8TensorLinearMethod", "Fp8BlockLinearMethod", "Mxfp8LinearMethod", "Nvfp4LinearMethod",
     "BankSpec", "ExpertView", "MoEConfig", "MoEKernel", "MoEMethod",
-    "UnquantizedMoEMethod", "Fp8BlockMoEMethod", "Nvfp4MoEMethod", "Mxfp4MoEMethod", "Mxfp8MoEMethod",
+    "UnquantizedMoEMethod", "Fp8BlockMoEMethod", "Nvfp4MoEMethod", "Mxfp4MoEMethod", "Mxfp8MoEMethod", "Q4_0MoEMethod",
     "QuantBackend", "set_quant_backend", "get_quant_backend", "NameMap",
     "QuantConfig", "NoQuantConfig", "ModelOptConfig", "CompressedTensorsConfig", "Fp8BlockConfig", "Mxfp4Config",
-    "quant_method_for", "quantization_config_of", "finalize_quant",
+    "quant_method_for", "format_expert_method", "quantization_config_of", "finalize_quant",
 ]
