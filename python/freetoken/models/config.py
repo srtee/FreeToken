@@ -278,6 +278,9 @@ class ModelConfig:
     attn_quant: str = "none"
     # the checkpoint's quant kind for the dense MLP projections (shared expert, dense layers), detected the same way
     dense_quant: str = "none"
+    # Width of the MTP draft carry (qwen4_exp: the pre-mix hyper-connection residual,
+    # hc_count * hidden). 0 = the carry is hidden_size-wide (qwen3_5 nextn style).
+    mtp_hidden_size: int = 0
     # the checkpoint's quant kind for the lm_head, detected the same way (only some NVFP4 exports quantize it)
     lm_head_quant: str = "none"
     shared_expert_intermediate_size: int = 0

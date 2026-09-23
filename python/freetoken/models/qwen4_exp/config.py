@@ -141,6 +141,12 @@ def parse_config(hf_config: Any) -> ModelConfig:
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
+    # The MTP draft head is a full_attention decoder-layer clone at layer_id =
+    # num_layers: fold it into the QSA group so num_index_layers and the pool
+    # geometry cover the draft's slab slot, and keep the flag for ModelConfig.
+    mtp_layers = int(getattr(text, "mtp_num_hidden_layers", 0) or 0)
+    if mtp_layers:
+        full_ids = full_ids + tuple(range(len(layer_types), len(layer_types) + mtp_layers))
 
     # the engine reads this flag for its MoE strategy decisions; every module takes its own scheme from the QuantConfig when it is built
     expert_scheme = QuantConfig.from_hf(hf_config).scheme_for_name("model.language_model.layers.0.mlp.experts.0.gate_proj")
@@ -239,6 +245,12 @@ def parse_config(hf_config: Any) -> ModelConfig:
         norm_topk_prob=bool(getattr(text, "norm_topk_prob", True)),
         moe_enabled=num_experts > 0,
         use_qk_norm=True,
+        mtp_num_hidden_layers=mtp_layers,
+        mtp_use_dedicated_embeddings=bool(
+            getattr(text, "mtp_use_dedicated_embeddings", False)
+        ),
+        # The draft carry is the pre-mix hc residual (pre_fc_norm_hidden is hc-width).
+        mtp_hidden_size=(qwen4_args.hc_count * text.hidden_size if mtp_layers else 0),
         model_type=getattr(hf_config, "model_type", "qwen4_exp"),
         architectures=getattr(hf_config, "architectures", ["Qwen4ExpForConditionalGeneration"]),
         vision_config=None,  # served text-only

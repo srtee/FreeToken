@@ -137,6 +137,20 @@ def _try_fuse(
     return None
 
 
+def _checkpoint_mtp_layers(model_path: str) -> int:
+    """``mtp_num_hidden_layers`` straight from the checkpoint config: the weight
+    reader has no ModelConfig (the generic loader calls it with path+device only),
+    and the MTP head exists whenever the checkpoint declares one. 0 on a missing
+    or unreadable config (no MTP tensors to remap)."""
+    try:
+        with open(os.path.join(model_path, "config.json")) as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return 0
+    text = raw.get("text_config", raw)
+    return int(text.get("mtp_num_hidden_layers") or 0)
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -164,6 +178,7 @@ def iter_weights(
         return
 
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
+    mtp_layers = _checkpoint_mtp_layers(model_path)
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -171,9 +186,25 @@ def iter_weights(
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
-                name = _rename(raw_name)
-                if name is None:
-                    continue
+                if raw_name.startswith("mtp."):
+                    # MTP draft head -> the module tree; the layers.0 index is
+                    # dropped (single block). Emitted only when the checkpoint
+                    # config builds the head -- load_state_dict is strict, so a
+                    # config/module disagreement fails loudly there. The stacked
+                    # experts are bare-tensor attrs (no .weight in the tree).
+                    if not mtp_layers:
+                        continue
+                    sub = raw_name[len("mtp."):]
+                    if sub.startswith("layers.0."):
+                        sub = "layer." + sub[len("layers.0."):]
+                    name = "model.mtp." + sub
+                    if name.endswith(("mlp.experts.gate_up_proj.weight",
+                                      "mlp.experts.down_proj.weight")):
+                        name = name[: -len(".weight")]
+                else:
+                    name = _rename(raw_name)
+                    if name is None:
+                        continue
                 tensor = f.get_tensor(raw_name)
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:

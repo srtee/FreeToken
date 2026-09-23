@@ -25,6 +25,7 @@ from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
 from .hc import GatedResidual
+from .mtp import Qwen4ExpMTPHead
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
 
@@ -98,6 +99,14 @@ class Qwen4ExpModel(BaseOP):
             ]
         )
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer")
+        # The MTP draft head (spec_mtp): a full qwen4_exp decoder layer at layer_id =
+        # num_layers plus the dual fc_hidden/fc_embedding neck. Shares the trunk's
+        # embedding by reference; lm_head is attached post-load (attach_mtp_head).
+        self.mtp = (
+            Qwen4ExpMTPHead(config, self.embed_tokens, prefix=f"{prefix}.mtp")
+            if config.mtp_num_hidden_layers > 0
+            else None
+        )
         # plain tuple (not an OP child), so it never shows up in the state dict
         self._ple = tuple(layer.ple for layer in self.layers.op_list if layer.ple is not None)
 
@@ -121,6 +130,7 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        self.last_hc_hidden = hidden  # pre-mix residual: the MTP draft carry
         return self.hyper_connection_mixer.mix(hidden)[0]
 
 
@@ -206,7 +216,15 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
-        return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+        out = self.model.forward(batch.input_ids, batch)
+        self.last_hidden = self.model.last_hc_hidden  # pre-mix carry (MTP draft input)
+        return self.lm_head.forward(out)
+
+    def attach_mtp_head(self) -> None:
+        """Give the draft head the trunk's lm_head (shared by reference —
+        mtp_use_dedicated_embeddings=false). Called after lm_head exists."""
+        if self.model.mtp is not None:
+            self.model.mtp.set_lm_head(self.lm_head)
 
 
 __all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "build_linear_mixer"]

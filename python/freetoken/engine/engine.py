@@ -479,7 +479,8 @@ class Engine:
                 cuda_graph_max_bs=config.cuda_graph_max_bs,
                 max_seq_len=aligned_max_seq_len,
                 vocab_size=config.model_config.vocab_size,
-                hidden_size=config.model_config.hidden_size,
+                hidden_size=(config.model_config.mtp_hidden_size
+                             or config.model_config.hidden_size),
                 dtype=config.dtype,
                 dummy_req=self.dummy_req,
             )
@@ -500,7 +501,8 @@ class Engine:
                     cuda_graph_max_bs=config.cuda_graph_max_bs,
                     max_seq_len=aligned_max_seq_len,
                     vocab_size=config.model_config.vocab_size,
-                    hidden_size=config.model_config.hidden_size,
+                    hidden_size=(config.model_config.mtp_hidden_size
+                                 or config.model_config.hidden_size),
                     dtype=config.dtype,
                     dummy_req=self.dummy_req,
                     moe_offload_cache=self.moe_offload_cache,
@@ -1005,7 +1007,8 @@ class Engine:
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             max_seq_len=aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,
-            hidden_size=config.model_config.hidden_size,
+            hidden_size=(config.model_config.mtp_hidden_size
+                         or config.model_config.hidden_size),
             dtype=config.dtype,
             dummy_req=self.dummy_req,
         )
@@ -1021,7 +1024,8 @@ class Engine:
                 cuda_graph_max_bs=config.cuda_graph_max_bs,
                 max_seq_len=aligned_max_seq_len,
                 vocab_size=config.model_config.vocab_size,
-                hidden_size=config.model_config.hidden_size,
+                hidden_size=(config.model_config.mtp_hidden_size
+                             or config.model_config.hidden_size),
                 dtype=config.dtype,
                 dummy_req=self.dummy_req,
                 moe_offload_cache=self.moe_offload_cache,
