@@ -68,12 +68,11 @@ class Qwen4ExpMTPMoE(BaseOP):
             hidden, config.num_experts, has_bias=False, prefix=f"{prefix}.gate")
         self.experts = _StackedExperts(
             config.num_experts, self.intermediate_size, hidden)
-        self.shared_expert_gate_up = LinearReplicated(
-            hidden, 2 * config.shared_expert_intermediate_size, has_bias=False,
-            prefix=f"{prefix}.shared_expert.gate_up_proj")
-        self.shared_expert_down = LinearReplicated(
-            config.shared_expert_intermediate_size, hidden, has_bias=False,
-            prefix=f"{prefix}.shared_expert.down_proj")
+        # Checkpoint-shaped submodule: keys are shared_expert.gate_up_proj /
+        # shared_expert.down_proj, exactly the trunk MoE's layout.
+        self.shared_expert = _SharedExpert(
+            hidden, config.shared_expert_intermediate_size,
+            prefix=f"{prefix}.shared_expert")
         self.shared_expert_gate = LinearReplicated(
             hidden, 1, has_bias=False, prefix=f"{prefix}.shared_expert_gate")
 
@@ -83,9 +82,9 @@ class Qwen4ExpMTPMoE(BaseOP):
         if self.norm_topk_prob:
             topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)
         routed = self._routed(hidden_states, topk_i, topk_w)
-        gate_up = self.shared_expert_gate_up.forward(hidden_states)
+        gate_up = self.shared_expert.gate_up_proj.forward(hidden_states)
         g, u = gate_up.chunk(2, dim=-1)
-        shared = self.shared_expert_down.forward(F.silu(g) * u)
+        shared = self.shared_expert.down_proj.forward(F.silu(g) * u)
         gate = torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
         return routed + shared * gate
 
@@ -109,6 +108,14 @@ class Qwen4ExpMTPMoE(BaseOP):
             out.index_add_(0, flat_ids[e] // K,
                            y * flat_w[e].to(y.dtype).unsqueeze(1))
         return out
+
+
+class _SharedExpert(BaseOP):
+    def __init__(self, hidden: int, inter: int, *, prefix: str) -> None:
+        self.gate_up_proj = LinearReplicated(
+            hidden, 2 * inter, has_bias=False, prefix=f"{prefix}.gate_up_proj")
+        self.down_proj = LinearReplicated(
+            inter, hidden, has_bias=False, prefix=f"{prefix}.down_proj")
 
 
 class Qwen4ExpMTPDraftLayer(BaseOP):
