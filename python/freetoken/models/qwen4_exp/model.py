@@ -225,6 +225,12 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         mtp_use_dedicated_embeddings=false). Called after lm_head exists."""
         if self.model.mtp is not None:
             self.model.mtp.set_lm_head(self.lm_head)
+            # The stacked draft experts (~4.7 GiB bf16) alone exceed this
+            # card's cache budget: pin them in host RAM instead. The draft
+            # gathers the selected rows per step (Qwen4ExpMTPMoE._routed),
+            # which also forces the eager draft path (no CUDA graph over a
+            # host gather).
+            self.model.mtp.offload_experts_to_host()
 
 
 __all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "build_linear_mixer"]

@@ -458,7 +458,14 @@ class Engine:
         # oracle and the debugging escape hatch.
         self.draft_graph_runner = None
         self.verify_graph_runner = None
-        if config.spec_mtp and os.environ.get("FT_SPEC_DRAFT_EAGER") != "1":
+        mtp = getattr(self.model.model, "mtp", None)
+        # Host-resident draft experts (qwen38-mtp: the stacks are pinned in
+        # host RAM) can't live inside a capture -- force the eager drafter.
+        draft_must_eager = (
+            os.environ.get("FT_SPEC_DRAFT_EAGER") == "1"
+            or getattr(mtp, "experts_host_resident", False)
+        )
+        if config.spec_mtp and not draft_must_eager:
             from .graph import MTPDraftGraphRunner
 
             # The expandable-segments allocator corrupts the MTP graph

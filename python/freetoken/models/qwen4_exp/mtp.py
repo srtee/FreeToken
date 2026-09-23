@@ -101,8 +101,18 @@ class Qwen4ExpMTPMoE(BaseOP):
         rows = torch.arange(flat_ids.numel(), device=x.device) // K
         for s in range(0, flat_ids.numel(), _EXPERT_CHUNK):
             e = slice(s, s + _EXPERT_CHUNK)
-            gu = gu_bank[flat_ids[e]]  # [n, 2I, H]
-            dw = dw_bank[flat_ids[e]]  # [n, H, I]
+            ids_e = flat_ids[e]
+            if not gu_bank.is_cuda:
+                # Host-resident stacks (the draft experts alone are ~4.7 GiB
+                # bf16 -- more than this card's whole slack): index on the CPU
+                # side, then one pinned H2D per chunk. The per-step slice is
+                # topk rows ~= 78 MiB at B=1, a few ms over PCIe.
+                ids_host = ids_e.cpu()
+                gu = gu_bank[ids_host].to(x.device, non_blocking=True)
+                dw = dw_bank[ids_host].to(x.device, non_blocking=True)
+            else:
+                gu = gu_bank[ids_e]  # [n, 2I, H]
+                dw = dw_bank[ids_e]  # [n, H, I]
             xk = x_rows[e].unsqueeze(1)
             g = torch.bmm(xk, gu[:, :I].transpose(1, 2)).squeeze(1)
             u = torch.bmm(xk, gu[:, I:].transpose(1, 2)).squeeze(1)
@@ -173,6 +183,21 @@ class Qwen4ExpMTPHead(BaseOP):
 
     def set_lm_head(self, lm_head) -> None:
         self._lm_head = lm_head
+
+    @property
+    def experts_host_resident(self) -> bool:
+        return not self.layer.mlp.experts.gate_up_proj.is_cuda
+
+    def offload_experts_to_host(self) -> None:
+        """Pin the stacked draft experts in host RAM (~4.7 GiB bf16). The draft
+        touches top-K expert rows per step (~78 MiB at B=1), so the PCIe gather
+        in :meth:`Qwen4ExpMTPMoE._routed` costs a few ms -- far cheaper than
+        the VRAM the stacks would hold on a 16 GiB card."""
+        s = self.layer.mlp.experts
+        for name in ("gate_up_proj", "down_proj"):
+            t = getattr(s, name)
+            if t.is_cuda:
+                setattr(s, name, t.cpu().pin_memory())
 
     def forward_rows(self, carry: torch.Tensor, input_ids: torch.Tensor, *,
                      with_logits: bool):
