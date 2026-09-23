@@ -15,6 +15,7 @@ import json
 
 import pytest
 import torch
+import torch.nn.functional as F
 from safetensors.torch import save_file
 
 from freetoken.models.qwen4_exp.mtp import Qwen4ExpMTPHead
@@ -119,3 +120,31 @@ def test_mtp_neck_math(mtp_config):
     ).reshape(T, hc * H)
     assert out.shape == (T, hc * H)
     torch.testing.assert_close(out, expect)
+
+
+def test_mtp_routed_moe_accumulates_per_token(mtp_config):
+    """Regression: _routed indexed the accumulation buffer by expert-id // K
+    instead of slot position // K — out-of-range rows whenever E/K > T."""
+    from freetoken.models.qwen4_exp.mtp import Qwen4ExpMTPMoE
+
+    torch.manual_seed(0)
+    moe = Qwen4ExpMTPMoE(mtp_config, prefix="model.mtp.layer.mlp")
+    for tensor in moe.state_dict().values():
+        tensor.normal_(0.0, 0.02)
+    T, K = mtp_config.qwen4_args.hc_count, mtp_config.num_experts_per_tok
+    x = torch.randn(T, mtp_config.hidden_size, dtype=torch.bfloat16)
+    topk_i = torch.randint(0, mtp_config.num_experts, (T, K))
+    topk_w = torch.softmax(torch.randn(T, K), dim=-1)
+
+    out = moe._routed(x, topk_i, topk_w)
+
+    expect = torch.zeros(T, mtp_config.hidden_size)
+    for t in range(T):
+        for k in range(K):
+            e = topk_i[t, k]
+            gu = moe.experts.gate_up_proj[e].float()
+            dw = moe.experts.down_proj[e].float()
+            g = gu[: moe.intermediate_size] @ x[t].float()
+            u = gu[moe.intermediate_size :] @ x[t].float()
+            expect[t] += topk_w[t, k] * (dw @ (F.silu(g) * u))
+    torch.testing.assert_close(out.float(), expect, rtol=1e-2, atol=1e-2)

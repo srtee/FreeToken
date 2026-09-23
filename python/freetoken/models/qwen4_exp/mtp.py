@@ -94,9 +94,11 @@ class Qwen4ExpMTPMoE(BaseOP):
         H, I = self.hidden_size, self.intermediate_size
         gu_bank, dw_bank = self.experts.gate_up_proj, self.experts.down_proj
         out = x.new_zeros(T, H)
-        flat_ids = topk_i.reshape(-1)  # token-major: row j belongs to token j // K
+        flat_ids = topk_i.reshape(-1)  # token-major: slot j belongs to token j // K
         x_rows = x.repeat_interleave(K, dim=0)
         flat_w = topk_w.reshape(-1)
+        # Accumulation rows are the SLOT position // K, never the expert id.
+        rows = torch.arange(flat_ids.numel(), device=x.device) // K
         for s in range(0, flat_ids.numel(), _EXPERT_CHUNK):
             e = slice(s, s + _EXPERT_CHUNK)
             gu = gu_bank[flat_ids[e]]  # [n, 2I, H]
@@ -105,7 +107,7 @@ class Qwen4ExpMTPMoE(BaseOP):
             g = torch.bmm(xk, gu[:, :I].transpose(1, 2)).squeeze(1)
             u = torch.bmm(xk, gu[:, I:].transpose(1, 2)).squeeze(1)
             y = torch.bmm((F.silu(g) * u).unsqueeze(1), dw.transpose(1, 2)).squeeze(1)
-            out.index_add_(0, flat_ids[e] // K,
+            out.index_add_(0, rows[e],
                            y * flat_w[e].to(y.dtype).unsqueeze(1))
         return out
 
