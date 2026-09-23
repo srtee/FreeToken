@@ -110,6 +110,13 @@ class GemmaPlusOneRMSNorm(BaseOP):
         return x.view(-1, self.size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not x.is_cuda:
+            # Unit-test / eager-reference path (mirrors hc._mix_torch): fp32 math.
+            xf = x.float()
+            return (
+                xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
+                * (1.0 + self.weight.float())
+            ).to(x.dtype)
         return self.gemma_rmsnorm(self._flat(x), self.weight, self.eps).view(x.shape)
 
     def forward_inplace(self, x: torch.Tensor) -> None:

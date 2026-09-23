@@ -209,7 +209,6 @@ def set_rope_device(device: torch.device):
     _ROPE_DEVICE = device
 
 
-@functools.cache
 def get_rope(
     head_dim: int,
     rotary_dim: int,
@@ -218,17 +217,39 @@ def get_rope(
     rope_scaling: Tuple[Tuple[str, Any], ...] | None = None,
     is_neox: bool = True,
 ) -> RotaryEmbedding:
-    rope_map = dict(rope_scaling) if rope_scaling is not None else None
-    t = torch.tensor([])
-    if t.device == torch.device("meta"):
-        # we cannot use meta device for rope
+    # The cache is keyed on the BUILD device: rope instances are device-bound
+    # (the kernels reject a cache tensor from the wrong device), so a caller
+    # under one default device must never hand its instance to a caller under
+    # another. (The old single-entry cache let a CPU-first test poison CUDA
+    # callers in the same process.)
+    device = torch.get_default_device()
+    if device.type == "meta":
+        # the engine constructs the model on meta; rope must materialize on
+        # the serving device set at engine startup
         if _ROPE_DEVICE is None:
             raise RuntimeError(
                 "We cannot use meta device for rope. Please call set_rope_device() first."
             )
-        with torch.device(_ROPE_DEVICE):
-            return _get_rope(head_dim, rotary_dim, max_position, base, rope_map, is_neox)
-    return _get_rope(head_dim, rotary_dim, max_position, base, rope_map, is_neox)
+        device = _ROPE_DEVICE
+    return _get_rope_cached(head_dim, rotary_dim, max_position, base, rope_scaling, is_neox, device)
+
+
+@functools.cache
+def _get_rope_cached(
+    head_dim: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    rope_scaling: Tuple[Tuple[str, Any], ...] | None,
+    is_neox: bool,
+    device: torch.device,
+) -> RotaryEmbedding:
+    rope_map = dict(rope_scaling) if rope_scaling is not None else None
+    with torch.device(device):
+        return _get_rope(head_dim, rotary_dim, max_position, base, rope_map, is_neox)
+
+
+get_rope.cache_clear = _get_rope_cached.cache_clear
 
 
 __all__ = ["get_rope", "RotaryEmbedding", "set_rope_device"]
