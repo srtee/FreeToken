@@ -97,6 +97,22 @@ ft serve --model $FREETOKEN_QWEN4EXP_MODEL --spec-mtp \
     --disable-moe-prefill-overlap
 ```
 
+
+Production serving on this box (alone on the card, 2026-09): ratio 0.88,
+chunked prefill to bound the cold expert-streaming spike, and the
+client-visible window pinned to the actual KV budget — `/v1/models` and
+`ft launch` clients read `--max-seq-len-override`, which otherwise claims
+the HF 262k while the pool holds ~31k tokens (verified: 25.7k-token needle
+retrieval passes; warm radix retry ~11 s after a 13 m cold prefill):
+
+```bash
+PYTORCH_ALLOC_CONF=expandable_segments:True ft serve \
+    --model $FREETOKEN_QWEN4EXP_MODEL --spec-mtp \
+    --memory-ratio 0.88 --max-running-requests 2 --moe-cache-size 512 \
+    --disable-moe-prefill-overlap --max-prefill-length 4096 \
+    --max-seq-len-override 30720
+```
+
 - Startup must load the MTP head cleanly (mapping drift fails loudly in
   `load_state_dict` here).
 - Send **greedy** request (`temperature: 0` — spec arm only engages on
