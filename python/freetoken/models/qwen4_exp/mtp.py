@@ -192,12 +192,21 @@ class Qwen4ExpMTPHead(BaseOP):
         """Pin the stacked draft experts in host RAM (~4.7 GiB bf16). The draft
         touches top-K expert rows per step (~78 MiB at B=1), so the PCIe gather
         in :meth:`Qwen4ExpMTPMoE._routed` costs a few ms -- far cheaper than
-        the VRAM the stacks would hold on a 16 GiB card."""
+        the VRAM the stacks would hold on a 16 GiB card. Idempotent: returns
+        without touching an already-host-resident head."""
         s = self.layer.mlp.experts
+        moved = False
         for name in ("gate_up_proj", "down_proj"):
             t = getattr(s, name)
             if t.is_cuda:
                 setattr(s, name, t.cpu().pin_memory())
+                moved = True
+        if moved:
+            # Release the freed VRAM back to the driver: the engine's pool
+            # budget is measured with mem_get_info, which cannot see into
+            # PyTorch's caching allocator, so 4.7 GiB would otherwise stay
+            # accounted as resident after the stacks move off-GPU.
+            torch.cuda.empty_cache()
 
     def forward_rows(self, carry: torch.Tensor, input_ids: torch.Tensor, *,
                      with_logits: bool):
