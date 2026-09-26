@@ -86,14 +86,30 @@ Expected: Tier 1's failure list again (the PLE test), nothing new.
 Then the acceptance test — speculative decode end to end:
 
 ```bash
+# Alone on the card:
 ft serve --model $FREETOKEN_QWEN4EXP_MODEL --spec-mtp
+
+# Cohabiting another GPU process (e.g. LAMMPS): cap the engine's VRAM claim so
+# both fit, halve the GDN state pool (scales with concurrency), and disable the
+# prefill-overlap double-buffer (needs moe-cache-size >= 2*512 slots):
+ft serve --model $FREETOKEN_QWEN4EXP_MODEL --spec-mtp \
+    --memory-ratio 0.85 --max-running-requests 2 --moe-cache-size 512 \
+    --disable-moe-prefill-overlap
 ```
 
 - Startup must load the MTP head cleanly (mapping drift fails loudly in
   `load_state_dict` here).
-- Send a **greedy** request (`temperature: 0` — the spec arm only engages on
-  greedy; request shape in `docs/cli.md`) and check the output is coherent.
-- A/B decode speed: rerun without `--spec-mtp` on a long-generation prompt.
+- Send **greedy** request (`temperature: 0` — spec arm only engages on
+  greedy; request shape in `docs/cli.md`) check output is coherent.
+- A/B decode speed: rerun without `--spec-mtp` on long-generation prompt.
+  Expect solid uplift on warm caches (coding-style repeated prefixes
+  friendly case), muted on very first request (expert banks cold).
+- **Known limitation (stage-1)**: the spec arm silently degrades to plain
+  decode when `page_size != 1` (`scheduler.py:_spec_armed`). The qsa_sparse
+  backend pins page size 64, so on Flash-Next **the spec arm never engages
+  yet** — the A/B will show equal throughput on both arms. Enabling it needs
+  page-granular rollback in the reject path; the port, loader, budget fit and
+  end-to-end serve with the MTP head resident are otherwise complete.
   Expect a solid uplift on warm caches (coding-style repeated prefixes are
   the friendly case), muted on the very first request (expert banks cold).
 - Watch host RAM during startup: PLE pin + expert banks must fit the pin
