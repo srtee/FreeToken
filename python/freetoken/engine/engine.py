@@ -335,9 +335,17 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
-        finalize_quant(self.model)
+        # The MTP head's dense expert stacks load GPU-resident with the rest;
+        # a card cohabiting another process (LAMMPS) cannot afford their
+        # ~4.7 GiB in the cache-budget math. Pin them in host RAM before the
+        # post-weights baseline is measured (attach_mtp_head does this later
+        # on the engine path; here the budget needs it immediately).
+        mtp_early = getattr(self.model, "model", None)
+        mtp_early = getattr(mtp_early, "mtp", None)
+        if mtp_early is not None and hasattr(mtp_early, "offload_experts_to_host"):
+            mtp_early.offload_experts_to_host()
         post_weights_free = self._sync_get_memory()[0]
-        self._weights_bytes = self._baseline_free - post_weights_free
+        post_weights_free = self._sync_get_memory()[0]
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
         # resident but before ANY runtime cache pool (MoE expert cache below, KV pages, GDN
         # state) is allocated. This is the stable "if all free VRAM went to one pool" budget —
