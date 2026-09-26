@@ -345,7 +345,8 @@ class Engine:
         if mtp_early is not None and hasattr(mtp_early, "offload_experts_to_host"):
             mtp_early.offload_experts_to_host()
         post_weights_free = self._sync_get_memory()[0]
-        post_weights_free = self._sync_get_memory()[0]
+        self._weights_bytes = self._baseline_free - post_weights_free
+        self._post_weights_free = post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
         # resident but before ANY runtime cache pool (MoE expert cache below, KV pages, GDN
         # state) is allocated. This is the stable "if all free VRAM went to one pool" budget —
