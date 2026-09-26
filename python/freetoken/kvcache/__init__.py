@@ -163,6 +163,16 @@ def create_kvcache_pool(
     # slabs.
     layer_ids: tuple[int, ...] | None = None
     kv_specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
+    # The MTP draft head's KV rows live at layer index num_layers (one per
+    # mtp layer) — the extended full-attn group's layer_ids include them, so
+    # every pool path's global-id validation bound must cover them. The bound
+    # is bookkeeping only: storage stays len(layer_ids).
+    n_pool_layers = max(
+        model_config.num_layers,
+        len(layer_ids) if layer_ids is not None else 0,
+        model_config.num_layers
+        + (getattr(model_config, "mtp_num_hidden_layers", 0) or 0),
+    )
     if model_config.has_linear_attention:
         assert len(kv_specs) == 1, (
             f"hybrid-linear models support one paged-KV group, got "
@@ -204,7 +214,7 @@ def create_kvcache_pool(
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
-            num_layers=model_config.num_layers,
+            num_layers=n_pool_layers,
             head_dim=spec.head_dim,
             num_pages=num_pages,
             page_size=page_size,
@@ -257,16 +267,6 @@ def create_kvcache_pool(
         )
 
     spec = kv_specs[0] if len(kv_specs) == 1 else None
-    # The MTP draft head's KV rows live at layer index num_layers (one per
-    # mtp layer) — the extended full-attn group's layer_ids include them, so
-    # the pool's global-id validation bound must cover them on BOTH pool
-    # paths. The bound is bookkeeping only: storage stays len(layer_ids).
-    n_pool_layers = max(
-        model_config.num_layers,
-        len(layer_ids) if layer_ids is not None else 0,
-        model_config.num_layers
-        + (getattr(model_config, "mtp_num_hidden_layers", 0) or 0),
-    )
     if kv_codec != "f16":
         from .turbo_pool import TurboKVCache
 
