@@ -11,6 +11,7 @@ Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.e
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -184,7 +185,17 @@ def iter_weights(
         desc="Loading weights",
         disable=not get_tp_info().is_primary(),
     ):
-        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+        # Lazily-opened CPU sibling handle when the checkpoint builds the MTP
+        # head: shard 12 mixes trunk and mtp.* tensors, so the MTP branch must
+        # not fall back to the (possibly CUDA) primary handle.
+        with contextlib.ExitStack() as stack:
+            f_cpu = (
+                stack.enter_context(
+                    safetensors.safe_open(file, framework="pt", device="cpu"))
+                if mtp_layers else None
+            )
+            f = stack.enter_context(
+                safetensors.safe_open(file, framework="pt", device=str(device)))
             for raw_name in f.keys():
                 if raw_name.startswith("mtp."):
                     # MTP draft head -> the module tree; the layers.0 index is
@@ -205,7 +216,12 @@ def iter_weights(
                     name = _rename(raw_name)
                     if name is None:
                         continue
-                tensor = f.get_tensor(raw_name)
+                # MTP tensors always land in host RAM: the dense draft expert
+                # stacks (~4.7 GiB bf16) would eat a 16 GiB card's entire cache
+                # budget just by sitting in the weights byte count.
+                tensor = (f_cpu.get_tensor(raw_name) if f_cpu is not None
+                          and raw_name.startswith("mtp.")
+                          else f.get_tensor(raw_name))
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
