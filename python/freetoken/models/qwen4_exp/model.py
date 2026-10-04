@@ -28,6 +28,8 @@ from .hc import GatedResidual
 from .mtp import Qwen4ExpMTPHead
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
+from freetoken.models.blocks import embed_input_ids
+from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMixin
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -116,7 +118,8 @@ class Qwen4ExpModel(BaseOP):
         return list(self._ple)
 
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
-        hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
+        hidden = embed_input_ids(self.embed_tokens, input_ids, batch)
+        hidden = hidden.repeat(1, self.hc_count)
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
@@ -190,6 +193,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 "per_head_vocab_sizes": emb.ngram_heads_vocab_sizes.tolist(),
                 "per_head_offsets": emb.ngram_heads_offsets.tolist(),
                 "eos_token_id": args.ngram_boundary_token_id,
+                "image_token_id": args.image_token_id,
             }
             disk_table = DiskRowTable(
                 resolve_row_source(folder),
@@ -233,4 +237,18 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             self.model.mtp.offload_experts_to_host()
 
 
-__all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "build_linear_mixer"]
+class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__(config)
+        if config.is_multimodal:
+            assert not config.vision_config.deepstack_visual_indexes, "Qwen3.8 consumes no DeepStack features"
+            self.visual = Qwen3VLVisionModel(config.vision_config, quant_config=config.quant, prefix="visual")
+
+
+__all__ = [
+    "Qwen4ExpDecoderLayer",
+    "Qwen4ExpForCausalLM",
+    "Qwen4ExpForConditionalGeneration",
+    "Qwen4ExpModel",
+    "build_linear_mixer",
+]

@@ -23,6 +23,7 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Operating System :: POSIX :: Linux",
     "Environment :: GPU :: NVIDIA CUDA",
+    "Environment :: GPU :: AMD ROCm",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -49,6 +50,7 @@ dependencies = [
     "numpy>=2.0,<2.5",
     "openai>=2.0,<3",
     "partial-json-parser>=0.2,<1",
+    "pillow>=10,<13",
     "prompt_toolkit>=3.0,<4",
     "pydantic>=2.9,<3",
     "pyzmq>=27,<28",
@@ -58,6 +60,9 @@ dependencies = [
     # Install torch separately from a cu12x index, then `-e . --no-build-isolation`.
     "torch>=2.6,<2.12",
     "tqdm>=4.66,<5",
+    # sm70 fork: upstream's 5.16 floor + torchvision>=0.26 are for the Qwen3-VL path
+    # (torchvision 0.26 pins torch 2.11 and would drag the resolver past the cu12x
+    # torch); multimodal serving is off-contract on sm_70, so neither is carried.
     "transformers>=5.5,<6",
     "triton>=3.5,<3.8; platform_system == 'Linux'",  # sm70: floor = production pin triton==3.5.0 (3.2 has a tile-independent codegen bug; 3.6+ bundles CUDA-13 ptxas, no sm_70). Serve installs it --no-deps over the SIF default; fla kernels carry no 3.2-only APIs.
     "uvicorn>=0.30,<1",
@@ -76,7 +81,7 @@ dev = ["pytest>=6.0"]
 # Native fused-kernel packages. Without them the runtime falls back to the pure-Triton
 # kernels in freetoken.kernel.triton (and the 'triton' attention backend). Install
 # `freetoken[accel]` for the full native fast path.
-fi = ["flashinfer-python[cu13]>=0.6,<0.7"]
+fi = ["flashinfer-python[cu13]==0.6.18.post1"]
 # renamed from sgl-kernel at 0.4; still imports as `sgl_kernel`, so never co-install both
 sgl = ["sglang-kernel==0.4.5"]
 accel = ["freetoken[fi,sgl]"]
@@ -100,11 +105,6 @@ sglang-kernel = { index = "sglang-cu130" }
 [[tool.uv.index]]
 name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
-explicit = true
-
-[[tool.uv.index]]
-name = "sglang-cu130"
-url = "https://docs.sglang.io/whl/cu130"
 explicit = true
 
 [tool.setuptools]

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field, replace
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, List
+from typing import TYPE_CHECKING, Any, List, Mapping
 
 import torch
 from freetoken.distributed import DistributedInfo
-from freetoken.models.register import _load_attr, get_model_spec
+from freetoken.layers.quantization import set_quant_config
+from freetoken.mm.config import ENCODER_SECTIONS, MultimodalConfig
+from freetoken.models.register import EncoderSpec, ModelSpec, _load_attr, checkpoint_quant_config, get_model_spec
 from freetoken.utils import cached_load_hf_config, init_logger
-from freetoken.utils.hf import optional_hf_file
 
 if TYPE_CHECKING:
     from freetoken.models import ModelConfig
@@ -21,6 +23,8 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
+    # --hf-overrides: applied to the checkpoint config the model is built from (cached_load_hf_config)
+    hf_overrides: Mapping[str, Any] = field(default_factory=dict)
     max_running_req: int = 4
     attention_backend: str = "auto"
     moe_strategy: str = "auto"
@@ -105,6 +109,8 @@ class EngineConfig:
     # The verify runs n+1 sequential 1-row batches per request either way;
     # only the scheduler's advance span and the resolve grow with n.
     spec_draft_n: int = 1
+    # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
+    mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
         if self.kv_codec_tune != "none" and self.kv_codec == "f16":
@@ -122,23 +128,49 @@ class EngineConfig:
 
     @cached_property
     def hf_config(self):
-        return cached_load_hf_config(self.model_path)
+        return cached_load_hf_config(self.model_path, self.hf_overrides)
+
+    @cached_property
+    def model_spec(self) -> ModelSpec:
+        return get_model_spec(self.hf_config.architectures[0])
+
+    @cached_property
+    def active_encoders(self) -> tuple[EncoderSpec, ...]:
+        """The encoder towers this process builds: the family registers them, the checkpoint config carries their section, --mm-disable did not name them."""
+        return tuple(
+            e
+            for e in self.model_spec.encoders
+            if getattr(self.hf_config, e.config_key, None) is not None
+            and e.kind not in self.mm.disabled_encoders
+        )
+
+    @cached_property
+    def served_modalities(self) -> frozenset[str]:
+        """Modalities this process accepts."""
+        return frozenset(m for e in self.active_encoders for m in e.modalities)
 
     @cached_property
     def model_config(self) -> ModelConfig:
-        spec = get_model_spec(self.hf_config.architectures[0])
-        parse_config = _load_attr(spec.module, spec.parse_config)
-        model_config = parse_config(self.hf_config)
+        # the parser sees no section for a tower this process does not build (for the vision tower that also means 1-D rope)
+        hf_config = copy.copy(self.hf_config)
+        built = {e.config_key for e in self.active_encoders}
+        for key in set(ENCODER_SECTIONS) | {e.config_key for e in self.model_spec.encoders}:
+            if key not in built:
+                setattr(hf_config, key, None)
+        spec = self.model_spec
         # GGUF configs carry their per-tensor type table on ``gguf_type_table``; the
         # dense-factory ``quant`` field stays None (the family's convert_*_to_gguf
         # replaces the dense layers with native GGUF ops right after construction).
-        return replace(model_config, quant=checkpoint_quant_config(self.model_path, self.hf_config, spec))
+        quant = checkpoint_quant_config(self.model_path, hf_config, spec)
+        set_quant_config(quant)
+        model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
+        return replace(model_config, quant=quant)
 
     @property
     def max_seq_len(self) -> int:
         if self.max_seq_len_override is not None:
             return self.max_seq_len_override
-        return self.model_config.rotary_config.max_position
+        return self.model_config.rotary_config.table_positions
 
     @property
     def max_forward_len(self) -> int:
@@ -152,25 +184,3 @@ class EngineConfig:
         import os
 
         return f"tcp://127.0.0.1:{os.environ.get('FT_DIST_PORT', '2333')}"
-
-
-def checkpoint_quant_config(model_path: str, hf_config: Any, spec: Any):
-    """The checkpoint's QuantConfig under the family's naming, or None for GGUF, whose native-quant ops the shared parser does not model yet."""
-    from freetoken.layers.quantization import NameMap, QuantConfig
-
-    if spec.parse_config == "parse_gguf_config":
-        return None
-    # NOTE: ModelOpt exports before 0.41 keep the quantization config only in hf_quant_config.json, and the weight download fetches nothing but the safetensors shards, so this sidecar is fetched on its own.
-    hf_quant_config = None
-    sidecar = optional_hf_file(model_path, "hf_quant_config.json")
-    if sidecar is not None:
-        import json
-
-        with open(sidecar) as f:
-            hf_quant_config = json.load(f)
-    return QuantConfig.from_hf(
-        hf_config,
-        name_map=NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping),
-        unquantized=spec.unquantized_modules,
-        hf_quant_config=hf_quant_config,
-    )
