@@ -67,6 +67,7 @@ def _setup():
             config=SimpleNamespace(spec_draft_n=1),
             mtp_drafter=None,  # plain decode: the arm gate short-circuits
         ),
+        _model_is_mrope=False,  # upstream bridge reads it in the extend-protocol restore
     )
     return pool, cm, tm, dm, pt, stub
 
@@ -78,7 +79,6 @@ def _spec_req(pool, cm, tm, prompt_len=4, *, cached_len, device_len):
     prompt = torch.arange(1, prompt_len + 1, dtype=torch.int32)
     from freetoken.scheduler.utils import PendingReq
     mr = cm.match_req(PendingReq(uid=UID, input_ids=prompt,
-                                 mm_embeds=None,
                                  sampling_params=SamplingParams(max_tokens=64)))
     req = Req(input_ids=prompt, table_idx=tm.allocate(),
               cached_len=0, output_len=64, uid=UID,

@@ -203,6 +203,52 @@ def _checkpoint_mtp_layers(model_path: str) -> int:
     return int(text.get("mtp_num_hidden_layers") or 0)
 
 
+# Fixed single-block fusions for the configless MTP pass: the draft head's
+# projection layout is arch-fixed under ``model.mtp.layer.``, so its fusion
+# needs neither a family spec nor a quant config (the real-config path fuses
+# through _DenseFuser's packed_modules_mapping instead).
+_MTP_PREFIX = "model.mtp.layer."
+_MTP_FUSE: dict[str, tuple[str, ...]] = {
+    _MTP_PREFIX + "self_attn.qkv_proj.weight": (
+        _MTP_PREFIX + "self_attn.q_proj.weight",
+        _MTP_PREFIX + "self_attn.k_proj.weight",
+        _MTP_PREFIX + "self_attn.v_proj.weight",
+    ),
+    _MTP_PREFIX + "attn_hyper_connection.input_mix_weight_down_block_inject.weight": (
+        _MTP_PREFIX + "attn_hyper_connection.input_mix_weight_down.weight",
+        _MTP_PREFIX + "attn_hyper_connection.block_inject_weight.weight",
+    ),
+    _MTP_PREFIX + "mlp_hyper_connection.input_mix_weight_down_block_inject.weight": (
+        _MTP_PREFIX + "mlp_hyper_connection.input_mix_weight_down.weight",
+        _MTP_PREFIX + "mlp_hyper_connection.block_inject_weight.weight",
+    ),
+    _MTP_PREFIX + "mlp.shared_expert.gate_up_proj.weight": (
+        _MTP_PREFIX + "mlp.shared_expert.gate_proj.weight",
+        _MTP_PREFIX + "mlp.shared_expert.up_proj.weight",
+    ),
+}
+
+
+def _mtp_fuse(name: str, tensor: torch.Tensor, buf: dict[str, dict[int, torch.Tensor]]):
+    """``_DenseFuser.fuse`` twin for the fixed MTP groups: ``None`` (not a part),
+    ``()`` (buffered, incomplete), or the merged ``(name, tensor)``."""
+    for fused, parts in _MTP_FUSE.items():
+        for idx, part in enumerate(parts):
+            if name.endswith(part):
+                slots = buf.setdefault(fused, {})
+                slots[idx] = tensor
+                if len(slots) < len(parts):
+                    return ()
+                del buf[fused]
+                rows = [slots[i] for i in range(len(parts))]
+                pad_to = _PAD_TO.get(fused.rsplit(".", 2)[-2], 0)
+                pad = (-sum(t.shape[0] for t in rows)) % pad_to if pad_to else 0
+                if pad:
+                    rows.append(torch.zeros(pad, *rows[0].shape[1:], dtype=rows[0].dtype, device=rows[0].device))
+                return (fused, torch.cat(rows, dim=0))
+    return None
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -223,10 +269,21 @@ def iter_weights(
     if not include_non_moe:
         return
 
-    hf_config = cached_load_hf_config(model_path)
-    spec = get_model_spec(hf_config.architectures[0])
-    fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping)
+    # The dense pass needs a parseable HF config (family spec + fusion table).
+    # A missing or unreadable config keeps the fork's MTP gate semantics instead:
+    # the json-driven _checkpoint_mtp_layers decides the draft head, dense keys
+    # are skipped, and nothing crashes on the way there
+    # (tests/models/qwen4_exp/test_mtp.py exercises both).
+    try:
+        hf_config = cached_load_hf_config(model_path)
+    except Exception:
+        hf_config = None
     mtp_layers = _checkpoint_mtp_layers(model_path)
+    fuser = None
+    mtp_buf: dict[str, dict[int, torch.Tensor]] = {}
+    if hf_config is not None:
+        spec = get_model_spec(hf_config.architectures[0])
+        fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping)
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -264,6 +321,13 @@ def iter_weights(
                     # budget just by sitting in the weights byte count. (f_cpu is
                     # open whenever mtp_layers is set.)
                     tensor = f_cpu.get_tensor(raw_name)
+                    if fuser is None:
+                        fused = _mtp_fuse(name, tensor, mtp_buf)
+                        if fused is None:
+                            yield name, tensor
+                        elif fused != ():
+                            yield fused
+                        continue
                     fused = fuser.fuse(name, tensor)
                     if fused is None:
                         fuser.check_unfused(name, tensor)
@@ -276,6 +340,8 @@ def iter_weights(
                     continue
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
+                if fuser is None:
+                    continue  # configless checkpoint: MTP gate only, no dense pass
                 tensor = f.get_tensor(raw_name)
                 fused = fuser.fuse(name, tensor)
                 if fused is None:
@@ -284,7 +350,8 @@ def iter_weights(
                 else:
                     yield from fused
 
-    assert not fuser.buf, f"Incomplete projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
+    assert fuser is None or not fuser.buf, f"Incomplete projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
+    assert not mtp_buf, f"Incomplete MTP projection fusions: {sorted(mtp_buf)}"
 
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:

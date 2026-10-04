@@ -22,14 +22,19 @@ _CKPT = ("/home/sherntee/.cache/huggingface/hub/models--nvidia--"
 
 
 def _iter_mtp():
-    from freetoken.models.qwen3_5_moe.weight import _iter_weights_attn_fp8
+    from freetoken.layers.quantization import set_quant_config
+    from freetoken.models.qwen3_5_moe.weight import iter_weights
+    from freetoken.models.register import checkpoint_quant_config, get_model_spec
     from freetoken.distributed import set_tp_info, try_get_tp_info
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
+    from transformers import AutoConfig
+    hf = AutoConfig.from_pretrained(_CKPT)
+    set_quant_config(checkpoint_quant_config(_CKPT, hf, get_model_spec(hf.architectures[0])))
     got = {}
-    for name, t in _iter_weights_attn_fp8(_CKPT, torch.device("cpu"),
-                                          include_non_moe=True,
-                                          include_moe_experts=False):
+    for name, t in iter_weights(_CKPT, torch.device("cpu"),
+                                include_non_moe=True,
+                                include_moe_experts=False):
         if name.startswith("model.mtp."):
             got[name[len("model.mtp."):]] = t.cpu()
     return got
