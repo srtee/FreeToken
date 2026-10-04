@@ -151,6 +151,10 @@ class GGUFEmbedding(BaseOP):
         self.qweight = torch.empty(
             num_embeddings, row_bytes(embedding_dim, quant_type), dtype=torch.uint8
         )
+        # sm70 fork: output dtype follows the ambient default dtype the engine sets
+        # (torch_dtype(config.dtype) wraps create_model). The old hardcoded bf16 fed
+        # bf16 activations into the first RMSNorm -> ptxas rejects .bf16 below sm_80.
+        self._out_dtype = torch.get_default_dtype()
         self._embed_scale = embed_scale
         self._embed_scale_t: torch.Tensor | None = None
 
@@ -159,7 +163,7 @@ class GGUFEmbedding(BaseOP):
 
         flat = x.flatten()
         rows = self.qweight.index_select(0, flat)  # [n, row_bytes] packed
-        y = ggml_dequantize(rows, self._quant_type, flat.shape[0], self.embedding_dim, torch.bfloat16)
+        y = ggml_dequantize(rows, self._quant_type, flat.shape[0], self.embedding_dim, self._out_dtype)
         y = y.view(*x.shape, self.embedding_dim)
         if self._embed_scale is not None:
             if self._embed_scale_t is None:
