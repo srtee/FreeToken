@@ -227,3 +227,6 @@ benchmarks/cross_framework
 
 # local e2e/bench artifacts (harnesses may run with repo cwd)
 /results/
+
+# pynccl JIT link shim (machine-local; see docs/tp-flashnext-plan.md Phase 1)
+.tp2-nccl/
