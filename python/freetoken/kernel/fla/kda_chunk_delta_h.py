@@ -61,6 +61,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     h,
     h0,
     ht,
+    h_track,
+    track_pairs,
+    NT_TRACK: tl.constexpr,
     cu_seqlens,
     chunk_offsets,
     T,
@@ -152,6 +155,34 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             (1, 0),
         )
         tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
+        if NT_TRACK > 0:
+            # fp32 boundary snapshot (hybrid-radix tracker): b_h right here is the
+            # state ENTERING chunk i_t -- bit-exact fp32, unlike the bf16 h store
+            # above. Match this (boh + i_t) row in track_pairs and store from the
+            # registers: a radix hit must resume from the exact fresh-prefill state.
+            row = boh + i_t
+            for t in tl.static_range(NT_TRACK):
+                if tl.load(track_pairs + t * 2) == row:
+                    ht_base = (t * H + i_h) * V * K
+                    p_htt1 = tl.make_block_ptr(
+                        h_track + ht_base, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
+                    )
+                    tl.store(p_htt1, b_h1, boundary_check=(0, 1))
+                    if K > 64:
+                        p_htt2 = tl.make_block_ptr(
+                            h_track + ht_base, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+                        )
+                        tl.store(p_htt2, b_h2, boundary_check=(0, 1))
+                    if K > 128:
+                        p_htt3 = tl.make_block_ptr(
+                            h_track + ht_base, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
+                        )
+                        tl.store(p_htt3, b_h3, boundary_check=(0, 1))
+                    if K > 192:
+                        p_htt4 = tl.make_block_ptr(
+                            h_track + ht_base, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
+                        )
+                        tl.store(p_htt4, b_h4, boundary_check=(0, 1))
         if K > 64:
             p_h2 = tl.make_block_ptr(
                 h + i_t.to(tl.int64) * stride_h,
@@ -343,8 +374,11 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_indices: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
     use_exp2: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # This kernel is slightly different from fla to support Q/K with different head numbers.
+    # Hybrid-radix tracker: int64 [nt, 2] (row, pool_slot) pairs. The kernel
+    # stores each tracked chunk-boundary state (fp32, pre-rounding) into
+    # h_track at the matching row; see chunk_delta_h.py for the GDN twin.
+    track_pairs: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
@@ -362,6 +396,10 @@ def chunk_gated_delta_rule_fwd_h(
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
     h = k.new_empty(B, NT, H, V, K)
+    ntrack = 0 if track_pairs is None else track_pairs.shape[0]
+    h_track = (
+        k.new_empty(ntrack, H, V, K, dtype=torch.float32) if ntrack else None
+    )
     final_state = (
         k.new_empty(N, H, V, K, dtype=torch.float32) if output_final_state else None
     )
@@ -381,6 +419,12 @@ def chunk_gated_delta_rule_fwd_h(
         h=h,
         h0=initial_state,
         ht=final_state,
+        h_track=h_track,
+        track_pairs=(
+            track_pairs if track_pairs is not None
+            else k.new_zeros(1, dtype=torch.int64)
+        ),
+        NT_TRACK=ntrack,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
@@ -391,4 +435,4 @@ def chunk_gated_delta_rule_fwd_h(
         BT=BT,
         USE_EXP2=use_exp2,
     )
-    return h, v_new, final_state
+    return h, v_new, final_state, h_track

@@ -50,6 +50,9 @@ def _prefill(op, pool, monkeypatch, x, slot, t0=0, has_init=False, track=None):
     )
     if track is not None:
         fla.track_dst, fla.track_h_row, fla.track_conv_src = track
+        # production _build_track_metadata pairs (h_row, dst) for the kernel's
+        # fp32 snapshot side buffer
+        fla.track_pairs = torch.stack([fla.track_h_row, fla.track_dst], dim=1)
     batch = SimpleNamespace(is_decode=False, fla_metadata=fla)
     _patch_ctx(monkeypatch, pool, batch)
     return op.forward(x)

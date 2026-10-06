@@ -418,7 +418,12 @@ def test_track_snapshot_equals_a_prefill_stopped_at_the_boundary():
 
     stopped = torch.zeros_like(slab)
     _forward(layer, R[:CHUNK_SIZE], _meta([tokens[:CHUNK_SIZE]], [[EOS, EOS]], slots=[live]), stopped)
-    assert torch.equal(got, stopped[live])
+    # allclose, not torch.equal: the two forwards differ in row count (CHUNK_SIZE+6 vs
+    # CHUNK_SIZE), so value_proj's CPU GEMM picks a different kernel per M and the
+    # last-ULP drift carries into the state (measured max 8.3e-7). The snapshot itself
+    # is a pure gather; O(1) defects still trip this tolerance. Same convention as
+    # test_prefill_conv_matches_reference / test_prefix_hit_matches_the_uncached_run.
+    assert torch.allclose(got, stopped[live], rtol=1e-5, atol=1e-6)
 
 
 def test_prefix_hit_matches_the_uncached_run():

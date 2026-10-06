@@ -42,6 +42,7 @@ class FLAMetadata:
     track_h_row: torch.Tensor | None = None      # [nt] int64 row into h (boh_i + aligned//CHUNK)
     track_conv_src: torch.Tensor | None = None   # [nt, kernel-1] int64 conv-input token positions
     track_boundary_row: torch.Tensor | None = None  # [nt] int64 forward-local row of the track boundary; states with their own left context (qwen4_exp PLE) derive their windows from it
+    track_pairs: torch.Tensor | None = None     # [nt, 2] int64 (h_row, dst pool slot): the fla kernel writes each tracked boundary state into its fp32 side buffer at row
 
 
 def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
@@ -96,7 +97,8 @@ def _build_track_metadata(reqs, cu_host, device, pin):
     prefill forward, snapshot its GDN state at the deepest mid-chunk boundary into its current
     ping-pong slot. Returns the ``FLAMetadata`` track kwargs, all None when no request
     tracks (non-hybrid, or all extends < CHUNK+1)."""
-    empty = dict(track_dst=None, track_h_row=None, track_conv_src=None, track_boundary_row=None)
+    empty = dict(track_dst=None, track_h_row=None, track_conv_src=None,
+                 track_boundary_row=None, track_pairs=None)
     if not any(r.mamba_ping_pong is not None for r in reqs):
         return empty
     from freetoken.core import get_global_ctx
@@ -129,11 +131,17 @@ def _build_track_metadata(reqs, cu_host, device, pin):
     if not dst:
         return empty
     to = lambda xs, **kw: torch.tensor(xs, **pin, **kw).to(device, non_blocking=True)
+    dst_t = to(dst, dtype=torch.int64)
+    h_row_t = to(h_row, dtype=torch.int64)
     return dict(
-        track_dst=to(dst, dtype=torch.int64),
-        track_h_row=to(h_row, dtype=torch.int64),
+        track_dst=dst_t,
+        track_h_row=h_row_t,
         track_conv_src=to(conv_src, dtype=torch.int64),
         track_boundary_row=to(boundary_rows, dtype=torch.int64),
+        # (h_row, pool_slot) per tracked boundary: the fla chunk kernel writes
+        # each boundary state into the fp32 h_track side buffer at the matching
+        # row (the bf16 h buffer would round the snapshot).
+        track_pairs=torch.stack([h_row_t, dst_t], dim=1),
     )
 
 

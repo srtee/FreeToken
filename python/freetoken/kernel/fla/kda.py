@@ -1016,7 +1016,7 @@ def _chunk_kda_fwd_with_cumulative_g(
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
-    return_h: bool = False,
+    track_pairs: torch.Tensor | None = None,
 ):
     # Token-offset addressing (q/k/g at `(bos*H + i_h) * K`) is still int32 in the
     # intra-chunk kernels: refuse a varlen batch long enough to wrap rather than
@@ -1056,7 +1056,7 @@ def _chunk_kda_fwd_with_cumulative_g(
         chunk_indices=chunk_indices,
     )
     del A
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+    h, v_new, final_state, h_track = chunk_gated_delta_rule_fwd_h(
         k=kg,
         w=w,
         u=u,
@@ -1066,6 +1066,7 @@ def _chunk_kda_fwd_with_cumulative_g(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         use_exp2=True,
+        track_pairs=track_pairs,
     )
     del w, u, kg
     o = chunk_gla_fwd_o_gk(
@@ -1081,13 +1082,9 @@ def _chunk_kda_fwd_with_cumulative_g(
         chunk_size=chunk_size,
     )
     del Aqk, v_new
-    if return_h:
-        # FreeToken addition: expose the per-chunk state snapshots (h[b, i] is the
-        # state at the START of chunk i) for hybrid-radix track checkpoints.
-        return o, final_state, h
-    del h
-    return o, final_state
-
+    # Always a 3-tuple: h_track is the fp32 boundary snapshot side buffer
+    # (rows in track_pairs order), None when track_pairs is None.
+    return o, final_state, h_track
 
 def chunk_kda_fwd(
     q: torch.Tensor,
@@ -1099,6 +1096,7 @@ def chunk_kda_fwd(
     initial_state: torch.Tensor,
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
+    track_pairs: torch.Tensor | None = None,
 ):
     chunk_size = FLA_CHUNK_SIZE
     chunk_indices = (
@@ -1127,6 +1125,7 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
+        track_pairs=track_pairs,
     )
 
 
@@ -1144,7 +1143,7 @@ def chunk_kda_with_fused_gate_fwd(
     cu_seqlens: torch.Tensor | None = None,
     safe_gate: bool = False,
     lower_bound: float = -5.0,
-    return_h: bool = False,
+    track_pairs: torch.Tensor | None = None,
 ):
     chunk_size = FLA_CHUNK_SIZE
     chunk_indices = (
@@ -1174,7 +1173,7 @@ def chunk_kda_with_fused_gate_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
-        return_h=return_h,
+        track_pairs=track_pairs,
     )
 
 
@@ -1198,7 +1197,7 @@ def chunk_kda(
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
 
-    o, final_state = chunk_kda_fwd(
+    o, final_state, _ = chunk_kda_fwd(
         q=q,
         k=k,
         v=v.contiguous(),
@@ -1227,15 +1226,16 @@ def chunk_kda_with_fused_gate(
     cu_seqlens: torch.Tensor | None = None,
     safe_gate: bool = False,
     lower_bound: float = -5.0,
-    return_h: bool = False,
+    track_pairs: torch.Tensor | None = None,
     **kwargs,
 ):
     """Run chunk KDA from raw gate projection using fused gate+cumsum.
 
     WARNING: the output is written into (and returned as) the ``v`` buffer; never
-    pass a tensor that is read again after this call. With ``return_h`` the
-    per-chunk state snapshots (h[b, i] = state at the START of chunk i) are
-    returned as a third value, for hybrid-radix track checkpoints.
+    pass a tensor that is read again after this call. The third return value is
+    the fp32 boundary snapshot side buffer (``h_track[ntrack, H, V, K]``, rows in
+    ``track_pairs`` order) for hybrid-radix track checkpoints; ``None`` without
+    ``track_pairs``.
     """
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -1258,10 +1258,8 @@ def chunk_kda_with_fused_gate(
         cu_seqlens=cu_seqlens,
         safe_gate=safe_gate,
         lower_bound=lower_bound,
-        return_h=return_h,
+        track_pairs=track_pairs,
     )
-
-
 @triton.autotune(
     configs=[
         triton.Config({"BT": bt}, num_warps=nw, num_stages=ns)

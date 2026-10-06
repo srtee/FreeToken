@@ -18,7 +18,8 @@ per-slot state read/write (slot 0 is its NULL sentinel == the pool's padding
 slot); ``chunk_kda_with_fused_gate`` prefills from an explicitly gathered
 initial state and returns the final state, which this op scatters back (the
 kernel CLOBBERS its v buffer -- v here is an ephemeral conv output, so that is
-free). Hybrid-radix track snapshots ride the per-chunk h (``return_h``).
+free). Hybrid-radix track snapshots ride the fp32 boundary side buffer
+(``track_pairs``).
 """
 
 from __future__ import annotations
@@ -81,13 +82,15 @@ class Glm5NextKDA(BaseOP):
     def _conv_weight(self) -> torch.Tensor:
         return self.conv1d.weight.squeeze(1)  # [conv_dim, kernel]
 
-    def _write_track_snapshot(self, pool, li, conv_in, h, fla) -> None:
+    def _write_track_snapshot(self, pool, li, conv_in, h_track, fla) -> None:
         """Hybrid-radix: snapshot recurrent + conv state at the chunk-aligned track
         boundary into a donatable pool slot (same contract as GDN, see
-        qwen3_5_moe/gdn.py). h rows are the kernel's per-chunk [V, K] states --
-        a direct copy into the pool's [K, V] slots (D_k == D_v)."""
+        qwen3_5_moe/gdn.py). h_track rows are the kernel's fp32 side-buffer states,
+        taken verbatim: a radix hit must resume from the bit-exact boundary state a
+        fresh prefill evolves (the old bf16 h snapshot made continuations diverge
+        on near-tie tokens)."""
         rec = pool.recurrent_states[li]
-        rec.index_copy_(0, fla.track_dst, h[0, fla.track_h_row].to(rec.dtype))
+        rec.index_copy_(0, fla.track_dst, h_track.to(rec.dtype))
         cv = pool.conv_states[li]
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
@@ -171,14 +174,12 @@ class Glm5NextKDA(BaseOP):
                 cu_seqlens=fla.cu_seqlens,
                 safe_gate=True,
                 lower_bound=self.lower_bound,
-                return_h=track,
+                track_pairs=fla.track_pairs if track else None,
             )
-            if track:
-                core_out, final_state, chunk_h = result
-                self._write_track_snapshot(pool, li, conv_in, chunk_h, fla)
-            else:
-                core_out, final_state = result
+            core_out, final_state, h_track = result
             rec.index_copy_(0, slot_ids, final_state.to(rec.dtype))
+            if track:
+                self._write_track_snapshot(pool, li, conv_in, h_track, fla)
 
         core_out = core_out.reshape(-1, d)
         out = self.o_norm.forward(core_out, g2.reshape(-1, d)).reshape(total, -1)
