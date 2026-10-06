@@ -10,6 +10,7 @@ from .activation import (
 from .base import BaseOP, OPList, StateLessOP
 from .embedding import ParallelLMHead, VocabParallelEmbedding
 from .linear import (
+    LinearColLocalMerged,
     LinearColParallelMerged,
     LinearOProj,
     LinearQKVMerged,
@@ -41,6 +42,7 @@ __all__ = [
     "OPList",
     "VocabParallelEmbedding",
     "ParallelLMHead",
+    "LinearColLocalMerged",
     "LinearColParallelMerged",
     "LinearRowParallel",
     "LinearOProj",
