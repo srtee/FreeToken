@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
+from freetoken.distributed import get_tp_info
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
-from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.layers import BaseOP, GatedRMSNorm, LinearColLocalMerged, LinearRowParallel
 from freetoken.layers.quantization import QuantConfig
 from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
+from freetoken.utils import div_even
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -42,12 +45,21 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         assert head_k_dim == head_v_dim, (
             f"GatedDeltaNet requires head_k_dim == head_v_dim, got {head_k_dim} != {head_v_dim}"
         )
-        self.num_k_heads = num_k_heads
-        self.num_v_heads = num_v_heads
+        # TP: the module keeps the rank-LOCAL head counts -- every forward path
+        # (conv, splits, reshapes, the fla kernels) and the LinearStatePool
+        # geometry (kvcache/linear_state_pool._linear_local_dims, the same
+        # div_even math) are local. The input projections are built with the
+        # LOCAL group sizes (LinearColLocalMerged: the qkvz packing's k/v head
+        # blocks do not chunk contiguously, so the loader supplies head-grouped
+        # local rows verbatim); out_proj is row-parallel from GLOBAL dims and
+        # all-reduces.
+        tp_size = get_tp_info().size
+        self.num_k_heads = div_even(num_k_heads, tp_size, allow_replicate=True)
+        self.num_v_heads = div_even(num_v_heads, tp_size, allow_replicate=True)
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
-        self.key_dim = num_k_heads * head_k_dim
-        self.value_dim = num_v_heads * head_v_dim
+        self.key_dim = self.num_k_heads * head_k_dim
+        self.value_dim = self.num_v_heads * head_v_dim
         self.conv_dim = 2 * self.key_dim + self.value_dim
         self.conv_kernel_size = conv_kernel_size
         # quantized checkpoints quantize qkv|z but not b|a, so the fusion splits into a qkvz GEMM and a ba GEMM with their own schemes (matches sglang / vLLM)
@@ -55,20 +67,31 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             quant_config is not None and quant_config.scheme_for(f"{prefix}.in_proj_qkvz") is not None
         )
 
-        self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
+        self._in_proj_split = [self.conv_dim, self.value_dim,
+                               self.num_v_heads, self.num_v_heads]
         if self._split_in_proj:
-            self.in_proj_qkvz = LinearColParallelMerged(
-                hidden_size, [self.conv_dim, self.value_dim], has_bias=False,
+            self.in_proj_qkvz = LinearColLocalMerged(
+                hidden_size,
+                [2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim,
+                 num_v_heads * head_v_dim],
+                [2 * self.num_k_heads * head_k_dim + self.num_v_heads * head_v_dim,
+                 self.num_v_heads * head_v_dim],
+                has_bias=False,
                 quant_config=quant_config, prefix=f"{prefix}.in_proj_qkvz",
             )
-            self.in_proj_ba = LinearColParallelMerged(
-                hidden_size, [num_v_heads, num_v_heads], has_bias=False,
+            self.in_proj_ba = LinearColLocalMerged(
+                hidden_size, [num_v_heads, num_v_heads], [self.num_v_heads] * 2,
+                has_bias=False,
                 quant_config=quant_config, prefix=f"{prefix}.in_proj_ba",
             )
         else:
             # Fused input projection (one GEMM instead of four): qkv | z | b | a.
-            self.in_proj = LinearColParallelMerged(
-                hidden_size, self._in_proj_split, has_bias=False,
+            self.in_proj = LinearColLocalMerged(
+                hidden_size,
+                [2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim,
+                 num_v_heads * head_v_dim, num_v_heads, num_v_heads],
+                self._in_proj_split,
+                has_bias=False,
                 quant_config=quant_config, prefix=f"{prefix}.in_proj",
             )
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
@@ -76,11 +99,11 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a
         # per-call .float() upcast in the decode wrapper. The weight loader exempts
         # *.A_log / *.dt_bias from the model-dtype downcast.
-        self.dt_bias = torch.empty(num_v_heads, dtype=torch.float32)
-        self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
+        self.dt_bias = torch.empty(self.num_v_heads, dtype=torch.float32)
+        self.A_log = torch.empty(self.num_v_heads, dtype=torch.float32)
         self.norm = GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=output_gate)
-        self.out_proj = LinearReplicated(
-            self.value_dim, hidden_size, has_bias=False,
+        self.out_proj = LinearRowParallel(
+            num_v_heads * head_v_dim, hidden_size, has_bias=False,
             quant_config=quant_config, prefix=f"{prefix}.out_proj",
         )
 
@@ -110,14 +133,17 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         return causal_conv1d_decode(conv_in, pool.conv_states[li], self._conv_weight(), table_idx)
 
     def _write_track_snapshot(self, pool, li: int, conv_in: torch.Tensor,
-                              h: torch.Tensor, fla) -> None:
+                              h_track: torch.Tensor, fla) -> None:
         """Snapshot this layer's recurrent + conv state at the chunk-aligned track boundary
         into a donatable pool slot, on the forward stream (hybrid-radix extra_buffer path).
-        SSM: ``recurrent_states[li, dst] = h[0, h_row]`` -- a DIRECT copy (h is [V,K], the
-        state pool is [K,V]; they coincide because GDN requires head_k_dim == head_v_dim).
-        Conv: the last (kernel-1) raw conv-input timesteps ending at the boundary."""
+        SSM: ``recurrent_states[li, dst] = h_track[j]`` -- the fla kernel's fp32 side-buffer
+        row for tracked boundary j (h_track is [V,K], the state pool is [K,V]; they
+        coincide because GDN requires head_k_dim == head_v_dim). fp32 -> fp32 with NO
+        rounding: a radix hit must resume from the bit-exact boundary state a fresh
+        prefill evolves (the old bf16 h snapshot made continuations diverge on near-tie
+        tokens). Conv: the last (kernel-1) raw conv-input timesteps ending at the boundary."""
         rec = pool.recurrent_states[li]
-        rec.index_copy_(0, fla.track_dst, h[0, fla.track_h_row].to(rec.dtype))
+        rec.index_copy_(0, fla.track_dst, h_track)
         cv = pool.conv_states[li]
         # conv_in [total, conv_dim]; gather the (kernel-1) window per tracked req.
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
@@ -186,11 +212,11 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
                 q, k, v, g, beta,
                 state_source=pool.recurrent_states[li], indices=fla.cache_indices,
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
-                return_h=track,
+                track_pairs=fla.track_pairs if track else None,
             )
             if track:
-                core_out, h = result
-                self._write_track_snapshot(pool, li, conv_in, h, fla)
+                core_out, h_track = result
+                self._write_track_snapshot(pool, li, conv_in, h_track, fla)
             else:
                 core_out = result
 

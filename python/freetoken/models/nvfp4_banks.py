@@ -59,6 +59,46 @@ def _bank_layer(spec: Nvfp4ExpertSourceSpec, layer: int, config) -> int | None:
     return bank_layer
 
 
+def _tp_slice_pieces(pieces, config):
+    """Shard each expert piece to this rank's intermediate slice under TP > 1.
+
+    The MoE all-reduce contract (layers/moe.py) sums per-rank partial expert outputs, so
+    each rank's banks must hold only its ``intermediate // tp_size`` slice. NVFP4 scale
+    groups run along K with GROUP=16: row-parallel roles (gate/up/gate_up + their scales)
+    slice on rows, down/down_scale on columns (the scale's group dim by //16), and the
+    per-tensor ``_global`` scales pass through unchanged.
+    """
+    from freetoken.distributed import get_tp_info
+
+    tp = get_tp_info()
+    full = config.moe_intermediate_size
+    if tp.size == 1:
+        return pieces
+    i_local = full // tp.size
+    if full % tp.size or i_local % 16:
+        raise NotImplementedError(
+            f"NVFP4 expert sharding needs moe_intermediate {full} divisible by "
+            f"tp_size {tp.size} and the local slice divisible by 16, got {i_local}"
+        )
+    start, end = tp.rank * i_local, (tp.rank + 1) * i_local
+
+    def _slice(name: str, t: torch.Tensor) -> torch.Tensor:
+        if name.endswith("_global"):
+            return t
+        scale = name.endswith("_scale")
+        base = name[: -len("_scale")] if scale else name
+        if base == "down":
+            cols = start // 16 if scale else start, end // 16 if scale else end
+            return t[:, cols[0]:cols[1]]
+        if base in ("gate", "up", "gate_up"):
+            rows = (2 * start, 2 * end) if base == "gate_up" else (start, end)
+            return t[rows[0]:rows[1]]
+        raise NotImplementedError(f"NVFP4 expert piece role {name!r} has no TP slice rule")
+
+    for bank_layer, e0, e1, piece in pieces:
+        yield bank_layer, e0, e1, {k: _slice(k, v) for k, v in piece.items()}
+
+
 def _kind_suffix(kind: str) -> str:
     return {"weight": "", "weight_scale": "_scale", "weight_scale_2": "_global"}[kind]
 
@@ -132,7 +172,10 @@ def iter_nvfp4_expert_pieces(
                 tensor = _ingest_global(spec, tensor)
             yield name, tensor
 
-    return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
+    return _tp_slice_pieces(
+        per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9),
+        config,
+    )
 
 
 __all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]

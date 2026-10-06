@@ -249,6 +249,106 @@ def _mtp_fuse(name: str, tensor: torch.Tensor, buf: dict[str, dict[int, torch.Te
     return None
 
 
+# --------------------------------------------------------------------------------------
+# TP sharding of the fused dense stream (docs/tp-flashnext-plan.md Phase 1)
+# --------------------------------------------------------------------------------------
+
+# suffix dispatch: kind tensors (block-fp8 scale pairs, biases) follow their
+# module's sharding axis
+_TP_COL_PARALLEL = (".qkv_proj", ".gate_up_proj")
+_TP_ROW_PARALLEL = (".o_proj", ".out_proj", ".down_proj")
+
+
+def _tp_sharder(model_config):
+    """Rank-local view of the fused dense stream -- ``qwen3_moe``'s shard_tensor
+    rules expressed over the FUSED names this reader emits: qkv is segmented
+    (q|gate col-sharded; kv chunked per head, replicated by head when kv < tp,
+    exactly the pool's local-kv math), and packed block-fp8 scale tensors ride
+    their module's axis.
+
+    Replicated on purpose: routers / norms / hyper-connection blocks / indexer
+    / PLE (their forward inputs are identical on every rank, so the sparse
+    attend selects the same blocks and gathers from local K/V), and the draft
+    head's necks and expert stacks (``.mlp.experts`` is the per-expert axis,
+    never a rank axis). ``model_config`` is the parsed ModelConfig (the dense
+    pass only runs at TP with a parseable checkpoint config); None keeps a
+    unit-test checkpoint's identity stream.
+    """
+    tp = get_tp_info()
+    if tp.size == 1:
+        return lambda _name, tensor: tensor
+    rank, ws = tp.rank, tp.size
+    head_dim = model_config.head_dim
+    q_rows = model_config.num_qo_heads * head_dim * 2
+    kv_rows = model_config.num_kv_heads * head_dim
+    num_kv = model_config.num_kv_heads
+
+    def _col(t):
+        return t.chunk(ws, dim=0)[rank].contiguous()
+
+    def _row(t):
+        return t.chunk(ws, dim=1)[rank].contiguous()
+
+    def _kv(t):
+        if num_kv < ws:
+            hd = t.shape[0] // num_kv
+            idx = rank * num_kv // ws
+            return t[idx * hd : (idx + 1) * hd].contiguous()
+        return _col(t)
+
+    def shard(name: str, tensor: torch.Tensor) -> torch.Tensor:
+        module = name
+        for suffix in (".weight_scale_inv", ".weight_scale", ".weight", ".bias"):
+            if module.endswith(suffix):
+                module = module[: -len(suffix)]
+                break
+        if ".mlp.experts." in module or module.endswith(".mlp.gate"):
+            return tensor
+        if module.endswith("self_attn.qkv_proj"):
+            q, k, v = tensor.split([q_rows, kv_rows, kv_rows], dim=0)
+            return torch.cat([_col(q), _kv(k), _kv(v)], dim=0)
+        if module.endswith(("embed_tokens", "lm_head")):
+            n = tensor.shape[0]
+            per = -(-n // ws)  # div_ceil: VocabParallelEmbedding pads internally
+            lo = rank * per
+            return tensor[lo : min(lo + per, n)].contiguous()
+        if module.endswith(_TP_ROW_PARALLEL):
+            return _row(tensor)
+        if module.endswith(_TP_COL_PARALLEL):
+            return _col(tensor)
+        groups = model_config.attention_groups
+        groups = groups() if callable(groups) else groups
+        gdn = next((g for g in groups if hasattr(g, "num_key_heads")), None)
+        if gdn is not None:
+            k0, v0 = gdn.num_key_heads, gdn.num_value_heads
+            kd, vd = gdn.key_head_dim, gdn.value_head_dim
+            assert k0 % ws == 0 and v0 % ws == 0, (
+                f"GDN head counts {k0}/{v0} must divide TP {ws}")
+            kl, vl = k0 // ws, v0 // ws
+            if module.endswith("linear_attn.in_proj_qkvz"):
+                qkv, z = tensor.split([2 * k0 * kd + v0 * vd, v0 * vd], dim=0)
+                q, k, v = qkv.split([k0 * kd, k0 * kd, v0 * vd], dim=0)
+                r = slice(rank * kl * kd, (rank + 1) * kl * kd)
+                rv = slice(rank * vl * vd, (rank + 1) * vl * vd)
+                return torch.cat([q[r], k[r], v[rv], z[rv]], dim=0).contiguous()
+            if module.endswith("linear_attn.in_proj_ba"):
+                b, a = tensor.split([v0, v0], dim=0)
+                rb = slice(rank * vl, (rank + 1) * vl)
+                return torch.cat([b[rb], a[rb]], dim=0).contiguous()
+            if module.endswith("linear_attn.conv1d"):
+                rows = torch.cat([torch.arange(rank * 2 * kl * kd, (rank + 1) * 2 * kl * kd),
+                                  torch.arange(2 * k0 * kd + rank * vl * vd,
+                                               2 * k0 * kd + (rank + 1) * vl * vd)])
+                return tensor[rows.to(tensor.device)].contiguous()
+            if module.endswith(("linear_attn.A_log", "linear_attn.dt_bias")):
+                return tensor[rank * vl:(rank + 1) * vl].contiguous()
+        if module.endswith(_TP_COL_PARALLEL):
+            return _col(tensor)
+        return tensor
+
+    return shard
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -264,8 +364,6 @@ def iter_weights(
     Fusions, per kind: attention q|k|v -> ``qkv_proj``; GDN ``in_proj_{qkv,z,b,a}`` -> ``in_proj``, or ``in_proj_qkvz`` + bf16 ``in_proj_ba`` when qkv|z is quantized; shared-expert gate|up -> ``gate_up_proj``; each per-layer HC's ``input_mix_weight_down`` | ``block_inject_weight`` -> a zero-padded ``input_mix_weight_down_block_inject``.
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the routed experts are NVFP4 and always come from the offload cache's expert reader.
     """
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
     if not include_non_moe:
         return
 
@@ -284,6 +382,12 @@ def iter_weights(
     if hf_config is not None:
         spec = get_model_spec(hf_config.architectures[0])
         fuser = _DenseFuser(get_quant_config(), spec.packed_modules_mapping)
+    # TP: shard every emitted tensor for this rank (identity at ws=1).
+    shard = (lambda _name, tensor: tensor)
+    if hf_config is not None:
+        from freetoken.models.qwen4_exp.config import parse_config
+
+        shard = _tp_sharder(parse_config(hf_config))
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -331,9 +435,10 @@ def iter_weights(
                     fused = fuser.fuse(name, tensor)
                     if fused is None:
                         fuser.check_unfused(name, tensor)
-                        yield name, tensor
+                        yield name, shard(name, tensor)
                     else:
-                        yield from fused
+                        for fused_name, fused_tensor in fused:
+                            yield fused_name, shard(fused_name, fused_tensor)
                     continue
                 name = _rename(raw_name)
                 if name is None:
@@ -346,9 +451,10 @@ def iter_weights(
                 fused = fuser.fuse(name, tensor)
                 if fused is None:
                     fuser.check_unfused(name, tensor)
-                    yield name, tensor
+                    yield name, shard(name, tensor)
                 else:
-                    yield from fused
+                    for fused_name, fused_tensor in fused:
+                        yield fused_name, shard(fused_name, fused_tensor)
 
     assert fuser is None or not fuser.buf, f"Incomplete projection fusions: {sorted(k[0] + k[1] for k in fuser.buf)}"
     assert not mtp_buf, f"Incomplete MTP projection fusions: {sorted(mtp_buf)}"

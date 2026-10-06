@@ -98,6 +98,36 @@ class LinearColParallelMerged(_LinearTPImpl):
         )
 
 
+class LinearColLocalMerged(_LinearTPImpl):
+    """Merged column-parallel linear with explicitly rank-local output sizes.
+
+    For fused projections whose global output axis does NOT chunk contiguously
+    into rank slices (the GDN ``in_proj_qkvz`` q|k|v|z packing interleaves
+    head-ordered k and v blocks), the loader prepares head-grouped local rows
+    and this class declares them verbatim: ``local_output_sizes`` are the
+    per-rank group sizes, ``output_sizes`` the global ones for metadata.
+    No communication: column-parallel output feeds the row-parallel
+    ``out_proj``'s all-reduce.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: List[int],
+        local_output_sizes: List[int],
+        has_bias: bool,
+        *,
+        quant_config: QuantConfig | None = None,
+        prefix: str = "",
+    ):
+        assert len(output_sizes) == len(local_output_sizes)
+        super().__init__(
+            input_size, sum(output_sizes), input_size, sum(local_output_sizes),
+            has_bias, output_sizes=tuple(local_output_sizes),
+            quant_config=quant_config, prefix=prefix,
+        )
+
+
 class LinearQKVMerged(_LinearTPImpl):
     def __init__(
         self,
