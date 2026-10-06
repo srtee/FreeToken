@@ -321,6 +321,8 @@ class ModelConfig:
     has_attn_bias: bool = False
     has_router_bias: bool = False
     moe_weight_format: str | None = None
+    # overall checkpoint weight layout; "gguf" marks the native-GGUF packed path
+    weight_format: str | None = None
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,
@@ -331,6 +333,14 @@ class ModelConfig:
     # DSA indexer geometry the model module needs. Opaque to model-agnostic engine code;
     # None for every other model.
     glm_dsa_args: Any | None = None
+    # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
+    # () for models without any. Requires a linear-attention group to ride on.
+    slot_states: Tuple[SlotStateSpec, ...] = ()
+    # GGUF-only: per-tensor ggml quant-type table from parse_gguf_config
+    # ({"token_embd": 11, "attn_q": {0: 11, ...}, ...}) consumed by the family's
+    # convert_*_to_gguf. Kept OFF ``quant`` -- that field must stay a QuantConfig (or
+    # None) for the dense layer factories that read it before the GGUF swap runs.
+    gguf_type_table: Any | None = None
     # GLM-5.3-Flash (glm5_next) payload (Glm5NextArgs): NoPE-MLA dims, the kpool indexer
     # geometry, the KDA head config, and the mHC knobs. Opaque to model-agnostic engine
     # code; None for every other model.

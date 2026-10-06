@@ -195,6 +195,7 @@ class CpuMoeExecutor:
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
+        self._down_q4_1 = False  # q4_0: providers normalize the down bank to Q4_1 (20B rows)
         ptrs, (self.H, self.I) = self._resolve_banks(
             {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()}, fmt
         )
@@ -238,6 +239,7 @@ class CpuMoeExecutor:
             activation_id=_ACT_IDS[activation],
             apply_router_weight_on_input=1 if apply_router_weight_on_input else 0,
             weight_format=_WFMT_IDS[fmt],
+            down_q4_1=int(self._down_q4_1),
             swiglu_alpha=float(swiglu_alpha),
             swiglu_limit=float(swiglu_limit) if swiglu_limit is not None else float("inf"),
             core_ids=core_ids,
@@ -405,10 +407,10 @@ class CpuMoeExecutor:
         return ptrs, (H, I)
 
     def _resolve_q4_0_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
-        """Native GGUF Q4_0 schema (gemma4 GGUF): per-32 blocks (fp16 scale + 16 nibble
-        bytes), row-major over K -- the *same* packed banks the GPU offload path streams.
-        gate_up is [S, 2I, H//32*18], down is [S, H, I//32*18]; the C++ W4A16 GEMV reads a
-        row in place (18 bytes / 32 K) and dequantizes weights inside the K-loop."""
+        """Native GGUF Q4_0 schema (gemma4/qwen3moe GGUF): per-32 blocks over the packed
+        banks the GPU offload path streams. gate_up rows are Q4_0 (18B/32K); the down
+        bank is always Q4_1 (20B/32K, [d][m][16B nibbles]) -- both providers normalize
+        it there for the ggml kernel -- so the C++ W4A16 GEMV picks the matching dot."""
         gate_up, down = banks["gate_up"], banks["down"]
         assert gate_up[0].dtype == torch.uint8 and down[0].dtype == torch.uint8, (
             gate_up[0].dtype, down[0].dtype,
@@ -418,7 +420,11 @@ class CpuMoeExecutor:
         assert gate_up[0].shape[1] == 2 * I
         assert H % 32 == 0 and I % 32 == 0, (H, I)
         assert int(gate_up[0].shape[2]) == (H // 32) * 18, (gate_up[0].shape, H)
-        assert int(down[0].shape[2]) == (I // 32) * 18, (down[0].shape, I)
+        dn_bytes = int(down[0].shape[2])
+        if dn_bytes == (I // 32) * 20:
+            self._down_q4_1 = True
+        else:
+            assert dn_bytes == (I // 32) * 18, (down[0].shape, I)
         ptrs = dict(
             gate_up_ptr=self._make_table(gate_up).data_ptr(),
             down_ptr=self._make_table(down).data_ptr(),

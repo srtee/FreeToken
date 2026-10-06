@@ -8,6 +8,7 @@ from .reader import (
     is_gguf_path,
     iter_gguf_tensors,
     load_gguf_metadata,
+    tensor_type_of,
     write_metadata_gguf,
 )
 
@@ -22,5 +23,6 @@ __all__ = [
     "is_gguf_path",
     "iter_gguf_tensors",
     "load_gguf_metadata",
+    "tensor_type_of",
     "write_metadata_gguf",
 ]

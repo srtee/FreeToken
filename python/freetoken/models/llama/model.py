@@ -81,6 +81,11 @@ class LlamaForCausalLM(BaseLLMModel):
         )
         super().__init__()
 
+        from .gguf import convert_llama_to_gguf, is_gguf_model
+
+        if is_gguf_model(config):
+            convert_llama_to_gguf(self, config)
+
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
         logits = self.lm_head.forward(output)
