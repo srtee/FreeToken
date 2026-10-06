@@ -253,6 +253,7 @@ def iter_weights(
     if include_non_moe or stacked:
         reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0])) if include_non_moe else None
         yield from _iter_shards(model_path, device, reader, stacked=stacked, include_vision=include_vision)
+        yield from _iter_mtp_weights(model_path, device)
 
 
 def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | None, *, stacked: bool, include_vision: bool):
@@ -282,6 +283,45 @@ def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | N
         lines = reader.missing()
         shown = "\n  ".join(lines[:8]) + (f"\n  ... {len(lines) - 8} more" if len(lines) > 8 else "")
         raise ValueError(f"checkpoint is missing tensors the quant config declares for {len(lines)} modules:\n  {shown}")
+
+
+def _iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield the MTP draft head (mtp-plan 0.1), remapped to the MTPHead module tree.
+
+    Plain bf16 regardless of the trunk quant scheme. q/k/v fuse into qkv_proj (the
+    trunk attention's LinearColParallelMerged layout, the gate half riding on q); the
+    draft experts keep the fused stacked layout (the eager MTPMoE consumes [E, ...]
+    directly); every mtp norm is Gemma (1 + weight) — baked here.
+    """
+    qkv_buf: dict[str, torch.Tensor] = {}
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw_name in f.keys():
+                if not raw_name.startswith("mtp."):
+                    continue
+                tensor = f.get_tensor(raw_name)
+                name = raw_name[len("mtp."):]
+                if name.startswith("layers.0."):
+                    name = "layer." + name[len("layers.0."):]
+                if ".self_attn.q_proj" in name:
+                    qkv_buf["q"] = tensor
+                    continue
+                if ".self_attn.k_proj" in name:
+                    qkv_buf["k"] = tensor
+                    continue
+                if ".self_attn.v_proj" in name:
+                    qkv_buf["v"] = tensor
+                    if len(qkv_buf) == 3:
+                        fused = torch.cat(
+                            [qkv_buf.pop("q"), qkv_buf.pop("k"), qkv_buf.pop("v")], dim=0)
+                        yield "model.mtp.layer.self_attn.qkv_proj.weight", fused
+                    continue
+                if ".self_attn.o_proj" in name:
+                    yield "model.mtp.layer.self_attn.o_proj.weight", tensor
+                    continue
+                if "norm" in name:
+                    tensor = tensor + 1.0  # Gemma (1 + weight)
+                yield "model.mtp." + name, tensor
 
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:

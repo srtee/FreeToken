@@ -96,6 +96,19 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen2ForCausalLM",
         packed_modules_mapping=_DENSE_PACKED,
     ),
+    # GGUF (native block-quant) dense adapters: same model classes, GGUF config + weight loaders.
+    "LlamaGGUFForCausalLM": ModelSpec(
+        "freetoken.models.llama",
+        "LlamaForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
+    "Qwen2GGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen2",
+        "Qwen2ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     "Qwen3ForCausalLM": ModelSpec(
         "freetoken.models.qwen3",
         "Qwen3ForCausalLM",
@@ -105,6 +118,23 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.qwen3_moe",
         "Qwen3MoeForCausalLM",
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
+    ),
+    # GGUF (native block-quant) qwen3-moe adapter: same model classes, GGUF
+    # config + weight loaders. Routed experts ride the q4_0 offload-bank path.
+    "Qwen3MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_moe",
+        "Qwen3MoeForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
+    # GGUF (native NVFP4) hybrid GDN+attention MoE adapter: qwen3_5_moe model
+    # classes; dense tensors dequantize to bf16, routed experts ride the NVFP4
+    # offload banks converted from the GGML NVFP4 blocks.
+    "Qwen35MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5MoeForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
     ),
     # Qwen3-VL: the Qwen3 text tower under model.language_model. plus the shared Qwen VL vision tower with DeepStack; the MoE variant ships its experts pre-stacked.
     "Qwen3VLForConditionalGeneration": ModelSpec(

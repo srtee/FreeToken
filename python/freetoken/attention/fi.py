@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Dict, List, Literal
@@ -217,6 +218,11 @@ class FlashInferBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
         self._initialize_metadata_once(metadata)
+        if os.environ.get("FT_DEBUG_STORE"):
+            import sys
+            print(f"[store] layer={layer_id} k={tuple(k.shape)} v={tuple(v.shape)} "
+                  f"out_loc={tuple(batch.out_loc.shape)} dtype={batch.out_loc.dtype}",
+                  file=sys.stderr)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         pool = self.kvcache
         if getattr(pool, "is_turbo", False):
@@ -299,7 +305,20 @@ class FlashInferBackend(BaseAttnBackend):
         from flashinfer import CUDAGraphBatchDecodeWithPagedKVCacheWrapper
 
         bs = batch.size
-        assert bs in self.capture_bs and bs not in self.graph_wrappers and self.capture
+        assert bs in self.capture_bs and self.capture
+        if bs in self.graph_wrappers:
+            # Re-capture of a second graph family at this bs (e.g. the MTP
+            # verify row after the draft step): REUSE the existing per-bs
+            # wrapper. The wrapper only binds static scratch buffers, and
+            # every replay re-plans (prepare_for_replay) before g.replay(),
+            # so the plan state is not shared state — sharing the wrapper
+            # is semantically identical to a fresh one.
+            self.prepare_metadata(batch)
+            metadata = batch.attn_metadata
+            assert isinstance(metadata, FIMetadata)
+            metadata.wrapper = self.graph_wrappers[bs]
+            self._initialize_metadata_once(metadata)
+            return
         capture = self.capture
         self.graph_wrappers[bs] = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
             self.float_workspace_buffer,

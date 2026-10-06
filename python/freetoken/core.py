@@ -27,6 +27,12 @@ class SamplingParams:
 
     @property
     def is_greedy(self) -> bool:
+        # Deterministic iff argmax: temperature <= 0 (T->0 softmax) or
+        # top_k == 1 (single survivor). top_p never matters — the max-prob
+        # token always survives a top_p filter — so a model-default top_p
+        # (e.g. Qwen3.6's 0.95 merged over an explicit temperature-0 HTTP
+        # request) must NOT demote a greedy request to sampled. It feeds
+        # the sampler's argmax fast path and the MTP spec arm gate.
         return self.temperature <= 0.0 or self.top_k == 1
 
 
@@ -64,6 +70,38 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # --- MTP spec decode (wave 2, depth-1): per-request loop state. ---
+    # Pending MTP carry: the trunk hidden (post-norm, [H]) the next draft
+    # consumes. Set after prefill (= the prefill's last hidden row) and
+    # refreshed by every spec resolve (verify row k's hidden, k = the
+    # accept count). None = draft is not armed for this req (degrade to
+    # plain decode — buun's not-ready draft skip, speculative.cpp:2960-2964).
+    spec_carry: "torch.Tensor | None" = None
+    # Spec arm state for the NEXT decode batch: the number of leading
+    # certain-row re-processes the verify forward must run BEFORE the
+    # drafted rows. 0 = normal (the n+1 fresh verify rows); after a reject
+    # at draft k the undone GDN state is re-derived by re-processing the
+    # undone position as row 0 of the next verify (1 leading row; 2+ only
+    # if several consecutive rejects stack — kept general).
+    spec_undone: int = 0
+    # Spec resolve staging (set by the engine's _build_spec_output, before
+    # the drain): the resolved next input token; how many drafts this
+    # iteration accepted (the drain emits the bonus only when > 0).
+    spec_next_input: int | None = None
+    # how many drafts the last spec iteration accepted (0..spec_draft_n);
+    # spec_accepted stays the any-accept bool the telemetry reads.
+    spec_accept_count: int = 0
+    spec_accepted: bool = False
+    # Mapped-but-uncommitted page count: pages allocate_paged mapped for the
+    # in-flight verify rows that the resolve has NOT yet committed (accept
+    # commits both, reject frees row B's and reconciles to 0). Nonzero ONLY
+    # while a spec iteration is between _prepare_spec_batch and
+    # _rollback_spec_rejects — i.e. an abort/finish landing inside that
+    # window. Plain decode NEVER has one: its device_len = cached_len + 1
+    # is the pending-token slot whose table row is stale, not an allocation
+    # (freeing it double-frees a live page — the 8195 != 8194 integrity
+    # crash). _free_req_resources frees exactly this many tail pages.
+    spec_mapped_tail: int = 0
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -162,6 +200,30 @@ class Batch:
     @property
     def is_decode(self) -> bool:
         return self.phase == "decode"
+
+    # --- MTP spec verify batches (wave 2): staging for _forward_spec_batch. ---
+    # The scheduler builds the per-row trunk verify batches (row A = the
+    # certain/undone token, row B = the draft), stages the draft tokens
+    # and carries, plus the MTP replay's input/position/out-loc tensors.
+    # None on every non-spec batch.
+    spec_row_batches: "List[Batch] | None" = None
+    spec_carry_gpu: "torch.Tensor | None" = None      # [B, H] GPU
+    spec_input_tokens_gpu: "torch.Tensor | None" = None  # [B] int32 GPU (row 0 tokens)
+    spec_replay_input_ids: "torch.Tensor | None" = None
+    spec_replay_positions: "torch.Tensor | None" = None
+    spec_replay_out_loc: "torch.Tensor | None" = None
+    spec_replay_attn_metadata: "BaseAttnMetadata | None" = None
+    # The MTP spec GDN-state snapshots per request: one pool slot per
+    # snapshot row 0..n-1 — the state AFTER verify row k, exactly what a
+    # reject at draft k's committed frontier [0, q+k+1) needs (captured by
+    # the engine BETWEEN successive row forwards; the old pre-verify
+    # snapshot was one row stale vs cached_len and corrupted attention
+    # state under rejects). The scheduler stages each hybrid req's slot
+    # list: slot 0 is the req's idle ping-pong track, slots 1..n-1 are
+    # per-iteration allocs (mirrored in spec_gdn_extra_slots); None for
+    # non-hybrid.
+    spec_gdn_snapshot_slots: "List[List[int]] | None" = None
+    spec_gdn_extra_slots: "List[int] | None" = None
 
     def get_attn_positions(self) -> torch.Tensor:
         return self.mrope_positions if self.mrope_positions is not None else self.positions

@@ -453,6 +453,33 @@ def parse_args(
         "and page_size=1; reads go through a dequantizing materializer.",
     )
     parser.add_argument(
+        "--spec-mtp",
+        action="store_true",
+        default=ServerArgs.spec_mtp,
+        help="MTP speculative decoding (Qwen3.5/3.6 checkpoints with an "
+        "mtp.* head): depth-1 greedy draft + verify, both CUDA-graphed "
+        "(trunk graphs are excluded instead). Lossless: greedy output is "
+        "byte-identical to plain decode.",
+    )
+    parser.add_argument(
+        "--spec-draft-n",
+        type=_positive_int,
+        default=ServerArgs.spec_draft_n,
+        help="Draft chain depth under --spec-mtp: 1 (depth-1, stage 3) or "
+        "2 (stage 4, --spec-draft-n 2). Depth n drafts n tokens per "
+        "iteration and verifies with n+1 sequential 1-row trunk forwards; "
+        "output stays byte-identical to plain greedy decode.",
+    )
+    parser.add_argument(
+        "--draft-vocab",
+        default=ServerArgs.draft_vocab,
+        help="Restrict MTP draft proposals to a vocabulary subset "
+        "(requires --spec-mtp): 'full' (default), a built-in subset name "
+        "(en-code, cyrillic, cjk), or a path to a subset .json built by "
+        "scripts/draft_vocab.py. Outputs stay byte-identical to plain "
+        "greedy decode; only the acceptance rate moves.",
+    )
+    parser.add_argument(
         "--kv-codec-tune",
         type=str,
         default=ServerArgs.kv_codec_tune,

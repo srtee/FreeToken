@@ -75,6 +75,15 @@ def parse_config(hf_config: Any) -> ModelConfig:
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
+    mtp_layers = getattr(text, "mtp_num_hidden_layers", 0) or 0
+    if mtp_layers:
+        # The MTP draft head is a full-attention decoder layer whose KV rows
+        # live at layer index num_layers..num_layers+mtp_layers-1 (the trunk
+        # pool allocates the extra storage layers; the draft reuses the same
+        # pool and page table).
+        full_ids = full_ids + tuple(
+            len(layer_types) + i for i in range(mtp_layers)
+        )
 
     # 3-axis rope only with vision; text-only serving keeps the 1-D partial rope and the decode-graph layout
     vision_config = parse_vision_config(hf_config)
@@ -135,6 +144,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
         norm_topk_prob=True,
         moe_enabled=moe_enabled,
         use_qk_norm=True,
+        mtp_num_hidden_layers=getattr(text, "mtp_num_hidden_layers", 0) or 0,
+        mtp_use_dedicated_embeddings=bool(
+            getattr(text, "mtp_use_dedicated_embeddings", False)),
+
         model_type=getattr(hf_config, "model_type", "qwen3_5_moe"),
         architectures=getattr(hf_config, "architectures", ["Qwen3_5MoeForConditionalGeneration"]),
         vision_config=vision_config,

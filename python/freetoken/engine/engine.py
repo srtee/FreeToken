@@ -25,6 +25,7 @@ from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
+from freetoken.engine.spec_mtp import batch_resolve_chain, per_position_accepts
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
@@ -323,14 +324,21 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
-
+    # MTP spec decode (wave 2): extra emitted tokens per request for the
+    # drain, beyond next_tokens (which is itself the FIRST emitted token:
+    # the draft d on accept, the corrected a on reject). [B, 1] int32,
+    # -1-padded: on accept = the bonus token; on reject = -1. None on
+    # plain (non-spec) batches — the drain falls back to single-token.
+    spec_extra_tokens_cpu: "torch.Tensor | None" = None
 
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
-        set_quant_backend(_adjust_ftw_quant_backend(config.model_path, QuantBackend.parse(config.quant_backend)))
-        _ensure_expandable_segments()  # before the first CUDA allocation below
+        # None ("auto") resolves to max_running_req in _adjust_config whenever
+        # graphs stay enabled, so under spec only an explicit 0 disables capture.
+        if not (config.spec_mtp and config.cuda_graph_max_bs != 0):
+            _ensure_expandable_segments()  # before the first CUDA allocation below
 
         from freetoken.gpu_select import bind_assigned_gpu
 
@@ -369,8 +377,18 @@ class Engine:
                 )
             # before the residency snapshot, so streamed blocks are not charged as resident weights
             self.model.place_encoder_weights(config.mm.encoder_weights)
+        # The MTP head's dense expert stacks load GPU-resident with the rest;
+        # a card cohabiting another process (LAMMPS) cannot afford their
+        # ~4.7 GiB in the cache-budget math. Pin them in host RAM before the
+        # post-weights baseline is measured (attach_mtp_head does this later
+        # on the engine path; here the budget needs it immediately).
+        mtp_early = getattr(self.model, "model", None)
+        mtp_early = getattr(mtp_early, "mtp", None)
+        if mtp_early is not None and hasattr(mtp_early, "offload_experts_to_host"):
+            mtp_early.offload_experts_to_host()
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
+        self._post_weights_free = post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
         # resident but before ANY runtime cache pool (MoE expert cache below, KV pages, GDN
         # state) is allocated. This is the stable "if all free VRAM went to one pool" budget —
@@ -411,6 +429,18 @@ class Engine:
                 if config.mm.disabled_encoders
                 else "Multimodal disabled: no encoder registered for this architecture"
             )
+
+        # MTP speculative decoding: the drafter owns the eager spec loop
+        # (draft -> 2-row verify -> resolve -> rollback) run inside
+        # forward_batch by the scheduler's verify batches (wave 2 Stage 1).
+        self.mtp_drafter = None
+        if getattr(config, "spec_mtp", False):
+            if getattr(config.model_config, "mtp_num_hidden_layers", 0) == 0:
+                raise ValueError("--spec-mtp requires a checkpoint with an mtp.* head")
+            if hasattr(self.model, "attach_mtp_head"):
+                self.model.attach_mtp_head()
+            from freetoken.engine.spec_mtp import MTPDrafter
+            self.mtp_drafter = MTPDrafter(self)
 
         # ======================= KV cache initialization ========================
         new_free = self._sync_get_memory()[1]
@@ -485,8 +515,10 @@ class Engine:
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
-            cuda_graph_max_bs=config.cuda_graph_max_bs,
+            # Trunk graphs stay disabled under --spec-mtp (stage 2 captures
+            # only the draft family; stage 3 restores the verify).
+            cuda_graph_bs=(None if config.spec_mtp else config.cuda_graph_bs),
+            cuda_graph_max_bs=(0 if config.spec_mtp else config.cuda_graph_max_bs),
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,
@@ -494,9 +526,69 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
         )
-        if config.attention_backend.split(",")[0] == "triton":
-            # Prefill runs on the first comma part; warm its autotune cache.
-            self._warmup_prefill()
+        # The MTP draft family captures AFTER the trunk runner (which is a
+        # no-op under --spec-mtp) so the draft's prepare_for_capture owns
+        # the FI backend's capture scratch. FT_SPEC_DRAFT_EAGER=1 skips
+        # capture entirely: the eager draft path stays the bit-equality
+        # oracle and the debugging escape hatch.
+        self.draft_graph_runner = None
+        self.verify_graph_runner = None
+        mtp = getattr(self.model.model, "mtp", None)
+        # Host-resident draft experts (qwen38-mtp: the stacks are pinned in
+        # host RAM) can't live inside a capture -- force the eager drafter.
+        draft_must_eager = (
+            os.environ.get("FT_SPEC_DRAFT_EAGER") == "1"
+            or getattr(mtp, "experts_host_resident", False)
+        )
+        if config.spec_mtp and not draft_must_eager:
+            from .graph import MTPDraftGraphRunner
+
+            # The expandable-segments allocator corrupts the MTP graph
+            # families' replays at bs >= 2 (cudaErrorIllegalAddress,
+            # reproducibly, every harness; draft/trunk families are
+            # unaffected). Flipping ES off around the capture stretch
+            # alone is NOT enough (M1/M2 probes): post-capture eager
+            # allocations under ES re-map the captured graphs' backing
+            # segments. ES is therefore never enabled in this process:
+            # _ensure_expandable_segments above is skipped under
+            # spec-graph capture, and rebuild/shutdown keep it off.
+            self.draft_graph_runner = MTPDraftGraphRunner(
+                stream=self.stream,
+                device=self.device,
+                mtp=self.model.model.mtp,
+                attn_backend=self.attn_backend,
+                max_running_req=config.max_running_req,
+                cuda_graph_max_bs=config.cuda_graph_max_bs,
+                max_seq_len=aligned_max_seq_len,
+                vocab_size=config.model_config.vocab_size,
+                hidden_size=(config.model_config.mtp_hidden_size
+                             or config.model_config.hidden_size),
+                dtype=config.dtype,
+                dummy_req=self.dummy_req,
+            )
+            # Stage 3: the verify-row family captures AFTER the draft
+            # family (same FI capture arm; its per-bs wrappers already
+            # exist and prepare_for_capture reuses them). FT_SPEC_VERIFY
+            # _EAGER=1 keeps the verify eager (the bit-equality oracle +
+            # debugging escape hatch, same pattern as the draft's).
+            if os.environ.get("FT_SPEC_VERIFY_EAGER") != "1":
+                from .graph import MTPVerifyGraphRunner
+
+                self.verify_graph_runner = MTPVerifyGraphRunner(
+                    stream=self.stream,
+                    device=self.device,
+                    model=self.model,
+                    attn_backend=self.attn_backend,
+                    max_running_req=config.max_running_req,
+                    cuda_graph_max_bs=config.cuda_graph_max_bs,
+                    max_seq_len=aligned_max_seq_len,
+                    vocab_size=config.model_config.vocab_size,
+                    hidden_size=(config.model_config.mtp_hidden_size
+                                 or config.model_config.hidden_size),
+                    dtype=config.dtype,
+                    dummy_req=self.dummy_req,
+                    moe_offload_cache=self.moe_offload_cache,
+                )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -739,6 +831,7 @@ class Engine:
             prefill_overlap=config.moe_prefill_overlap,
             prefill_hit_d2d=config.moe_prefill_hit_d2d,
             quant_format=banks.quant_format,
+            ggml_types=banks.ggml_types,
             decode_target=decode_target,
             hybrid_max_fetch=config.moe_hybrid_max_fetch,
             layout=layout,
@@ -989,8 +1082,20 @@ class Engine:
         # untouched (no rollback needed); after it, only a rebuild restores service.
         self.rebuild_teardown_started = True
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
+        # ES is re-enabled across the teardown/resize stretch (the whole point of
+        # the runtime rebuild is reclaiming/reallocating big pools), then flipped
+        # back off for the recapture below (same contract as startup).
         self.attn_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
+        if self.draft_graph_runner is not None:
+            # The draft family's graphs bind the old pools' addresses too;
+            # drop it with the trunk family (recaptured below against the
+            # new tensors). The verify family shares the same capture arm,
+            # so its wrappers die with reset_capture and its graphs with
+            # its own destroy (recaptured below).
+            self.draft_graph_runner.destroy_cuda_graphs()
+        if self.verify_graph_runner is not None:
+            self.verify_graph_runner.destroy_cuda_graphs()
         # 2. Resize caches in place (each frees its old GPU tensors before allocating).
         # Pin the new window first (validated above) so any KV-pool rebuild below sizes the window
         # to it (_dsv4_pool_sizes / _swa_paged_num_tokens read config.swa_num_pages_override).
@@ -1035,19 +1140,89 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
         )
+        # Re-capture the draft family against the new tensors too. ES stays
+        # off for the MTP families' lifetime (same contract as startup:
+        # _ensure_expandable_segments is skipped under spec-graph capture).
+        from .graph import MTPDraftGraphRunner
+
+        self.draft_graph_runner = MTPDraftGraphRunner(
+            stream=self.stream,
+            device=self.device,
+            mtp=self.model.model.mtp,
+            attn_backend=self.attn_backend,
+            max_running_req=config.max_running_req,
+            cuda_graph_max_bs=config.cuda_graph_max_bs,
+            max_seq_len=aligned_max_seq_len,
+            vocab_size=config.model_config.vocab_size,
+            hidden_size=(config.model_config.mtp_hidden_size
+                         or config.model_config.hidden_size),
+            dtype=config.dtype,
+            dummy_req=self.dummy_req,
+        )
+        if self.verify_graph_runner is not None:
+            from .graph import MTPVerifyGraphRunner
+
+            self.verify_graph_runner = MTPVerifyGraphRunner(
+                stream=self.stream,
+                device=self.device,
+                model=self.model,
+                attn_backend=self.attn_backend,
+                max_running_req=config.max_running_req,
+                cuda_graph_max_bs=config.cuda_graph_max_bs,
+                max_seq_len=aligned_max_seq_len,
+                vocab_size=config.model_config.vocab_size,
+                hidden_size=(config.model_config.mtp_hidden_size
+                             or config.model_config.hidden_size),
+                dtype=config.dtype,
+                dummy_req=self.dummy_req,
+                moe_offload_cache=self.moe_offload_cache,
+            )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        if self._spec_armed(batch):
+            return self._forward_spec_batch(batch)
+        return self._forward_plain_batch(batch, args)
+
+    def _spec_armed(self, batch: Batch) -> bool:
+        """Mirror of the scheduler's gate (the scheduler routes first; this
+        guards a direct engine call). Stage-1 rows are sequential 1-row
+        verify batches (GDN stream-order property Stage 3 must re-prove);
+        page_size == 1 required (the reject frees a mid-page slot
+        otherwise); carries must be pending."""
+        return (
+            self.mtp_drafter is not None
+            and batch.is_decode
+            and self.ctx.page_size == 1
+            and all(r.sampling_params.is_greedy and r.spec_carry is not None
+                    and (r.max_device_len - r.device_len) >= 2
+                    for r in batch.reqs)
+        )
+
+    def _forward_plain_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        import os
+        if os.environ.get("FT_DEBUG_STORE") and batch.is_decode:
+            import sys
+            lens = [r.extend_len for r in batch.padded_reqs]
+            print(f"[plain] bs={batch.size} padded={batch.padded_size} "
+                  f"extend_lens={lens} linear_idx="
+                  f"{tuple(batch.linear_table_idx.shape) if batch.linear_table_idx is not None else None}",
+                  file=sys.stderr)
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        self.last_hidden = getattr(self.model, "last_hidden", None)
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
 
+        # The prefill replay needs each req's ACTUAL extend span, which
+        # complete_one() destroys below (cached = device, device + 1 ->
+        # extend_len collapses to 1). Capture before.
+        prefill_lens = [req.extend_len for req in batch.reqs] if batch.is_prefill else None
         for req in batch.reqs:
             req.complete_one()
 
@@ -1056,9 +1231,289 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
+        if batch.is_prefill and self.mtp_drafter is not None:
+            self._stage_spec_prefill(batch, next_tokens_gpu, prefill_lens)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
+    def _stage_spec_prefill(self, batch: Batch, next_tokens_gpu,
+                            prefill_lens) -> None:
+        """Prefill stash (the loop's entry condition): replay the prefill
+        rows through the MTP head (layer-40 KV rows for the whole prompt —
+        see the replay comment below) and arm each req's FIRST spec
+        iteration — carry = the trunk's post-norm hidden at the req's
+        last prefill row (buun: prefill process()'s final h_nextn row;
+        speculative.cpp:2934-2936 + 2942-2983), next input = the sampled
+        token (dp.id_last). The row offset is the req's own extend: real
+        req rows come first in last_hidden (padded rows trail), each req's
+        LAST row is its extend_len-th. Greedy-only reqs stage; others stay
+        None and decode plain (the arm gate re-checks per batch)."""
+        hidden = self.last_hidden
+        if hidden is None:
+            return
+        # Prefill replay (semantics doc Q1 + Q4 — buun process() on the
+        # target batch, speculative.cpp:2841-2918): the MTP draft's
+        # attention attends over the layer-40 KV DENSELY, so a row must
+        # exist for EVERY prompt position before the first draft. Row i
+        # processes token i with the predecessor's target hidden (row 0 =
+        # the pending carry; cold start = zero, speculative.cpp:2881-2885
+        # — chunked continuations receive the previous chunk's last hidden
+        # as the pending carry). KV writes are the only consumed output.
+        mtp = self.model.model.mtp
+        # ONE whole-batch replay (buun process() shape, speculative.cpp:
+        # 2903): all reqs' rows go through the MTP head in a single
+        # forward under the prefill batch's own ctx (out_loc/positions/
+        # attn_metadata all describe exactly these rows). A per-req loop
+        # would hand each replay a 1-req k/v against the WHOLE batch's
+        # out_loc -> the store-shape mismatch that crashed the gate.
+        offset = 0
+        carry_parts = []
+        for i, req in enumerate(batch.reqs):
+            n = prefill_lens[i]
+            if n <= 0:
+                continue
+            rows = slice(offset, offset + n)
+            h_tgt = hidden[rows]
+            if req.spec_carry is not None:
+                # chunked continuation: the previous chunk's pending carry
+                head_carry = req.spec_carry.unsqueeze(0)
+            else:
+                head_carry = torch.zeros(
+                    (1, h_tgt.shape[-1]), dtype=h_tgt.dtype, device=h_tgt.device)
+            carry_parts.append(torch.cat([head_carry, h_tgt[: n - 1]], dim=0))
+            offset += n
+        if carry_parts:
+            carries = torch.cat(carry_parts, dim=0)
+            tokens = batch.input_ids[: carries.shape[0]]
+            with self.ctx.forward_batch(batch):
+                mtp.forward_rows(carries, tokens, with_logits=False)
+        # per-req stash (the loop's entry state)
+        offset = 0
+        for i, req in enumerate(batch.reqs):
+            n = prefill_lens[i]
+            if n <= 0:
+                continue
+            req.spec_carry = hidden[offset + n - 1]
+            # The sampler ran on this stream; the value is produced in
+            # order. The host read syncs the stream (~the drain's own
+            # copy_done cost — acceptable eager overhead, Stage 1).
+            req.spec_next_input = int(next_tokens_gpu[i].item())
+            offset += n
+
     @torch.inference_mode()
+
+    # ------------------------------------------------------------------
+    # MTP spec loop (wave 2 Stage 1, eager). The verify forward runs as a
+    # phase="prefill" extend batch built by the scheduler (2 rows/req
+    # through the SAME allocation + prepare_metadata machinery), so the
+    # trunk, the GDN chunk kernel, and the attention extend path all see
+    # a multi-row extend. Per iteration (semantics doc pseudocode):
+    #   verify rows [c@q, d@q+1]  ->  accept iff rowA argmax == d
+    #     accept: emit [d, bonus]; next input = bonus; carry = row B hidden
+    #     reject: emit [a]; next input = a; carry = row A hidden; roll
+    #             back row B (page-slot free + GDN restore + device_len
+    #             rewind; the next iteration re-processes the undone
+    #             position as its verify row A)
+    # The MTP replay (layer-40 rows for q and q+1) runs right after the
+    # verify forwards, per-row carries per buun process()
+    # (speculative.cpp:2865-2885). ALL req mutation completes before this
+    # returns (the overlap scheduler prepares the next batch afterwards).
+    # ------------------------------------------------------------------
+    def _forward_spec_batch(self, batch: Batch) -> ForwardOutput:
+        drafter = self.mtp_drafter
+        mtp = self.model.model.mtp
+        bs = batch.size
+        n_rows = len(batch.spec_row_batches)  # verify rows = drafts + 1
+        # One trunk forward per verify row ([bs] rows each — separate
+        # extends so each row's GDN state lands in stream order and the
+        # per-row hidden is directly addressable). Each row batch carries
+        # its own page slots, positions, and out_loc; the model.forward()
+        # consumes the batch ctx.
+        row_hiddens: list[torch.Tensor] = []
+        row_logits: list[torch.Tensor] = []
+        import os as _os
+        # GRAPHED verify (stage 3): the bs-exact verify family replays each
+        # row's trunk forward when captured; eager stays the oracle and the
+        # escape hatch.
+        _vrunner = getattr(self, "verify_graph_runner", None)
+        for row_idx, row_batch in enumerate(batch.spec_row_batches):
+            graphed = _vrunner is not None and _vrunner.can_verify(bs)
+            if graphed:
+                # GRAPHED verify row (stage 3): one replay per row. The
+                # captured kernels are identical to the eager decode path
+                # (same geometry, same per-bs FI wrapper) — only the
+                # staged buffer contents differ (tokens, slots, positions,
+                # out_loc, plan inputs). verify_row re-plans the FI
+                # metadata host-side BEFORE the replay (same contract as
+                # the trunk graph replay).
+                row_logits_i, row_hiddens_i = _vrunner.verify_row(row_batch)
+            else:
+                with self.ctx.forward_batch(row_batch):
+                    row_logits_i = self.model.forward()
+                row_hiddens_i = self.model.last_hidden
+            if _os.environ.get("FT_DEBUG_STORE"):
+                import sys as _sys
+                for i, wr in enumerate(row_batch.reqs):
+                    print(f"[row{row_idx}] uid={wr._req.uid} "
+                          f"tok={int(row_batch.input_ids[i])} "
+                          f"pos={int(row_batch.positions[i])} "
+                          f"cached={wr.cached_len} dev={wr.device_len} "
+                          f"argmax={int(row_logits_i[i].argmax())}",
+                          file=_sys.stderr)
+            if _os.environ.get("FT_VERIFY_AB"):
+                # A/B on ONE forward batch: (1) graphed replay on the
+                # scheduler's staging, (2) eager forward over THE SAME
+                # static staging (fresh tensors, same values, same GDN
+                # pool state — snapshotted/restored around both arms so
+                # each sees identical inputs). Divergence localizes the
+                # layer where the captured kernels disagree with eager.
+                import torch as _t
+                _snap = {}
+                if _pool is not None:
+                    for _wr in row_batch.reqs:
+                        _s = _wr.linear_slot_idx
+                        _snap[_s] = (
+                            _pool.conv_states[:, _s].clone(),
+                            _pool.recurrent_states[:, _s].clone())
+                _gl = row_logits_i[:bs].clone()
+                with _t.no_grad():
+                    if _pool is not None:
+                        for _wr in row_batch.reqs:
+                            _s = _wr.linear_slot_idx
+                            _pool.conv_states[:, _s].copy_(_snap[_s][0])
+                            _pool.recurrent_states[:, _s].copy_(_snap[_s][1])
+                    with self.ctx.forward_batch(row_batch):
+                        _el = self.model.forward()
+                if _pool is not None:
+                    for _wr in row_batch.reqs:
+                        _s = _wr.linear_slot_idx
+                        _pool.conv_states[:, _s].copy_(_snap[_s][0])
+                        _pool.recurrent_states[:, _s].copy_(_snap[_s][1])
+                _same = bool(_t.equal(_gl.argmax(-1), _el.argmax(-1)))
+                print(f"[AB] bs={bs} argmax_equal={_same} "
+                      f"graphed={_gl.argmax(-1).tolist()} "
+                      f"eager={_el.argmax(-1).tolist()}", flush=True)
+            # so the full [bs] (or [2bs]) logits/hidden are addressable.
+            # GRAPHED arm: verify_row returns VIEWS of the runner's static
+            # output buffers — row B's replay would overwrite row A's kept
+            # rows. The eager arm produces fresh tensors per forward and
+            # must NOT pay a copy; clone only the graphed arm's rows.
+            if graphed:
+                row_logits_i = row_logits_i[:bs].clone()
+                row_hiddens_i = row_hiddens_i[:bs].clone()
+            row_logits.append(row_logits_i[:bs])
+            row_hiddens.append(row_hiddens_i[:bs])
+            # MID-VERIFY GDN SNAPSHOT: the state after each row j < n is
+            # exactly what a reject at draft k = j needs (the committed
+            # frontier [0, q+j+1)). One snapshot per (req, row); in the
+            # graphed arm this copy runs on the engine stream AFTER the
+            # row's replay and BEFORE the next row's — the same program
+            # order the eager path relies on. (The last row never
+            # snapshots: nothing consumes a state after it.)
+            if row_idx < n_rows - 1 and batch.spec_gdn_snapshot_slots:
+                pool = self.linear_state_pool
+                if pool is not None:
+                    for req, snap_slots in zip(
+                            batch.reqs, batch.spec_gdn_snapshot_slots):
+                        pool.copy_from(req.linear_slot_idx,
+                                       snap_slots[row_idx])
+        drafter.stats.drafted += bs * (n_rows - 1)
+        row_argmaxes = torch.stack(
+            [row_logits[j].argmax(dim=-1).to(torch.int32)
+             for j in range(n_rows)], dim=1)      # [B, n+1]
+        drafts = batch.spec_drafts_gpu            # [B, n] int32 GPU
+        import os as _os
+        if _os.environ.get("FT_DEBUG_STORE"):
+            import sys as _sys
+            print(f"[resolve] rows={row_argmaxes.tolist()} "
+                  f"d={drafts.tolist()}", file=_sys.stderr)
+        steps = batch_resolve_chain(row_argmaxes, drafts)
+        drafter.stats.accepted += sum(s.accepted for s in steps)
+        if len(drafter.stats.accepted_at) != n_rows - 1:
+            drafter.stats.accepted_at = [0] * (n_rows - 1)
+        for j, c in enumerate(per_position_accepts(steps, n_rows - 1)):
+            drafter.stats.accepted_at[j] += c
+        carry = torch.stack(
+            [row_hiddens[s.carry_row][i] for i, s in enumerate(steps)], dim=0)
+        # MTP replay: one layer-40 row per offered draft, batched into a
+        # single forward (draft [b, c] @ position q+c+1). Per-row carries:
+        # row 0 = the pending carry, row c = verify row c-1's trunk hidden
+        # (each draft consumes the trunk hidden at its seed position).
+        # Replay outputs other than the KV writes are discarded.
+        replay_tokens = torch.stack(
+            [batch.spec_input_tokens_gpu]
+            + [drafts[:, c] for c in range(n_rows - 1)], dim=1).reshape(-1)
+        replay_carries = torch.stack(
+            [batch.spec_carry_gpu]
+            + [row_hiddens[j] for j in range(n_rows - 1)],
+            dim=1).reshape(n_rows * bs, -1)
+        replay_batch = self._mtp_replay_batch(batch)
+        with self.ctx.forward_batch(replay_batch):
+            mtp.forward_rows(replay_carries, replay_tokens, with_logits=False)
+        return self._build_spec_output(batch, steps, carry)
+
+    def _mtp_replay_batch(self, batch: Batch) -> Batch:
+        """A phase="decode" bookkeeping batch for the 2-row MTP replay:
+        positions from the verify rows, out_loc from the verify slots.
+        The MTP replay runs through MTPDraftLayer's Qwen3_5Attention,
+        which stores layer-40 KV via the trunk pool using out_loc."""
+        replay = Batch(reqs=list(batch.reqs), phase="prefill")
+        replay.padded_reqs = batch.padded_reqs
+        replay.input_ids = batch.spec_replay_input_ids
+        replay.positions = batch.spec_replay_positions
+        replay.out_loc = batch.spec_replay_out_loc
+        replay.attn_metadata = batch.spec_replay_attn_metadata
+        return replay
+
+    def _build_spec_output(self, batch: Batch, steps,
+                           carry: torch.Tensor) -> ForwardOutput:
+        """The spec batch's ForwardOutput: next_tokens = the FIRST emitted
+        token (GPU, for the scheduler's token_pool write mapping — the
+        last verify position), plus the drain's per-req extra emissions.
+
+        Per req (loop model / semantics doc Q3):
+          accept (k drafts): emitted = [d_1..d_k, bonus] — next_tokens =
+          d_1, extra = the remaining k entries (right-padded -1).
+          reject: emitted = [a]        — next_tokens = a, extra = -1.
+        The reject's rollback (page-slot free, GDN restore, device_len
+        rewind) is applied by the caller right after this returns — it
+        must happen before the next batch is PREPARED (the drain runs
+        after the next batch's launch under overlap, so the scheduler
+        rolls back inside _forward, before filter_reqs).
+
+        Also: the per-req spec-carry refresh (req.spec_carry) and the
+        pending bonus are staged here on the reqs; all host-visible.
+        """
+        bs = batch.size
+        device = self.device
+        first = torch.tensor(
+            [s.emitted[0] for s in steps], dtype=torch.int32, device=device)
+        max_extra = max((len(s.emitted) - 1 for s in steps), default=1)
+        extra = torch.full((bs, max_extra), -1, dtype=torch.int32,
+                           device=device)
+        for i, s in enumerate(steps):
+            for j, t in enumerate(s.emitted[1:]):
+                extra[i, j] = t
+        next_input = torch.tensor(
+            [s.next_input for s in steps], dtype=torch.int32, device=device)
+        accepted = torch.tensor([s.accepted for s in steps],
+                                dtype=torch.bool, device=device)
+        # Stage the next iteration's spec state on the reqs (host-visible
+        # bookkeeping; the scheduler drain + next _prepare_batch consume).
+        carry_cpu = carry.to("cpu", non_blocking=True)
+        for i, req in enumerate(batch.reqs):
+            req.spec_next_input = int(next_input[i].item())
+            req.spec_carry = carry_cpu[i]
+            req.spec_accept_count = int(steps[i].accepted)
+            req.spec_accepted = bool(accepted[i].item())
+        copy_done = torch.cuda.Event()
+        copy_done.record(self.stream)
+        return ForwardOutput(
+            next_tokens_gpu=first,
+            next_tokens_cpu=first.to("cpu", non_blocking=True),
+            copy_done_event=copy_done,
+            spec_extra_tokens_cpu=extra.to("cpu", non_blocking=True),
+        )
+
     def _warmup_prefill(self) -> None:
         """Compile the Triton prefill path before the first real request.
 
@@ -1112,8 +1567,6 @@ class Engine:
             dummy_row.fill_(dummy_slot)
             if self.moe_offload_cache is not None:
                 self.moe_offload_cache.reset()
-        ended.record(self.stream)
-        torch.cuda.synchronize(self.device)
         logger.info_rank0(
             f"Prefill warmup complete for lengths {warmup_lens} "
             f"in {started.elapsed_time(ended) / 1000.0:.3f} s"
@@ -1121,6 +1574,10 @@ class Engine:
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
+        if self.draft_graph_runner is not None:
+            self.draft_graph_runner.destroy_cuda_graphs()
+        if self.verify_graph_runner is not None:
+            self.verify_graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 

@@ -108,14 +108,17 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         return causal_conv1d_decode(conv_in, pool.conv_states[li], self._conv_weight(), table_idx)
 
     def _write_track_snapshot(self, pool, li: int, conv_in: torch.Tensor,
-                              h: torch.Tensor, fla) -> None:
+                              h_track: torch.Tensor, fla) -> None:
         """Snapshot this layer's recurrent + conv state at the chunk-aligned track boundary
         into a donatable pool slot, on the forward stream (hybrid-radix extra_buffer path).
-        SSM: ``recurrent_states[li, dst] = h[0, h_row]`` -- a DIRECT copy (h is [V,K], the
-        state pool is [K,V]; they coincide because GDN requires head_k_dim == head_v_dim).
+        SSM: ``recurrent_states[li, dst] = h_track[j]`` -- the kernel's fp32 side-buffer row
+        for tracked boundary j (h_track is [V, K], the state pool is [K, V]; they coincide
+        because GDN requires head_k_dim == head_v_dim). fp32 -> fp32 with NO rounding: a
+        radix hit must resume from the bit-exact boundary state a fresh prefill evolves
+        (the old bf16 h snapshot made continuations diverge on near-tie tokens).
         Conv: the last (kernel-1) raw conv-input timesteps ending at the boundary."""
         rec = pool.recurrent_states[li]
-        rec.index_copy_(0, fla.track_dst, h[0, fla.track_h_row].to(rec.dtype))
+        rec.index_copy_(0, fla.track_dst, h_track)
         cv = pool.conv_states[li]
         # conv_in [total, conv_dim]; gather the (kernel-1) window per tracked req.
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
@@ -165,8 +168,23 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
             )
         else:
-            mixed = self._conv_prefill(
-                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+            # Conv dispatch: a 1-token-per-req extend (the spec loop's
+            # verify rows) must use the DECODE conv kernel — the varlen
+            # conv kernels (fused sgl + triton fallback) leave the conv
+            # state UN-SHIFTED for a sequence shorter than the conv window
+            # with has_initial_state (their tail write skips/under-shifts
+            # when state_len > seqlen), so the window never advances and
+            # the trunk re-predicts stale tokens (the repetition
+            # attractor). The decode kernel's shift-append is correct for
+            # exactly this case (proven in
+            # tests/kernels/test_gdn_path_equivalence.py).
+            if (fla.has_initial_state is not None
+                    and (fla.cu_seqlens[1:] - fla.cu_seqlens[:-1] == 1).all()):
+                mixed = self._conv_decode(conv_in, fla.cache_indices, pool)
+            else:
+                mixed = self._conv_prefill(
+                    conv_in, pool, fla.cu_seqlens, fla.cache_indices,
+                    fla.has_initial_state)
             # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
@@ -184,11 +202,11 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 q, k, v, g, beta,
                 state_source=pool.recurrent_states[li], indices=fla.cache_indices,
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
-                return_h=track,
+                track_pairs=fla.track_pairs if track else None,
             )
             if track:
-                core_out, h = result
-                self._write_track_snapshot(pool, li, conv_in, h, fla)
+                core_out, h_track = result
+                self._write_track_snapshot(pool, li, conv_in, h_track, fla)
             else:
                 core_out = result
 

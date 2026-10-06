@@ -102,12 +102,27 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # MTP speculative decoding (Qwen3.5/3.6 checkpoints with an mtp.* head):
+    # depth-1 greedy draft + verify, eager (forces CUDA-graph exclusion).
+    spec_mtp: bool = False
+    # Draft chain depth under --spec-mtp: 1 (stage 3) or 2 (stage 4).
+    # The verify runs n+1 sequential 1-row batches per request either way;
+    # only the scheduler's advance span and the resolve grow with n.
+    spec_draft_n: int = 1
+    # MTP draft vocab restriction (--draft-vocab): "full" or a subset name/path.
+    # Only narrows what the draft head may propose; greedy verify stays lossless.
+    draft_vocab: str = "full"
     # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
         if self.kv_codec_tune != "none" and self.kv_codec == "f16":
             raise ValueError("--kv-codec-tune innerq requires a non-f16 --kv-codec")
+        if self.spec_mtp and not 1 <= self.spec_draft_n <= 2:
+            raise ValueError(
+                f"--spec-draft-n {self.spec_draft_n} unsupported: stage 4 gates depth 1-2")
+        if self.draft_vocab != "full" and not self.spec_mtp:
+            raise ValueError("--draft-vocab requires --spec-mtp")
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":
@@ -168,4 +183,9 @@ class EngineConfig:
 
     @property
     def distributed_addr(self) -> str:
-        return "tcp://127.0.0.1:2333"
+        # Fixed default; FT_DIST_PORT lets concurrent single-rank processes
+        # (offline gates/harnesses) avoid rendezvous-port collisions without
+        # touching the shared default.
+        import os
+
+        return f"tcp://127.0.0.1:{os.environ.get('FT_DIST_PORT', '2333')}"
