@@ -88,6 +88,17 @@ class EngineConfig:
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
+    # KV storage codec: f16 (default) or a TurboQuant/TCQ packed codec
+    # (turbo8 8.125 bpv, turbo4 4.125 bpv, turbo3_tcq 3.25 bpv, turbo2_tcq
+    # 2.25 bpv). Non-f16 requires head_dim % 128 == 0 (one rotation group
+    # per 128 values; wider heads carry independent groups), page_size=1,
+    # and the materializer path in the attention backend.
+    kv_codec: str = "f16"
+    # InnerQ per-channel equalization (TCQ plan 3.1): "none" (default) or
+    # "innerq". With innerq, the turbo pool calibrates per-channel K/V
+    # scales over the first ~2048 stored tokens, then equalizes channels
+    # before quantization and unscales at the materializer.
+    kv_codec_tune: str = "none"
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
@@ -95,6 +106,8 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
+        if self.kv_codec_tune != "none" and self.kv_codec == "f16":
+            raise ValueError("--kv-codec-tune innerq requires a non-f16 --kv-codec")
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":

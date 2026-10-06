@@ -81,6 +81,45 @@ use the vector kernel, larger batches fall back to dequant-then-matmul.
 
 Restriction: GGUF serving is TP=1 — packed quant rows and expert banks do not
 shard; TP>1 fails fast with a clear error.
+## KV storage codecs
+
+`ft serve --kv-codec {f16,turbo8,turbo4,turbo3_tcq,turbo2_tcq}` packs the KV
+cache with TurboQuant: each 128-value rotation group is L2-normalized, rotated
+with the signed FWHT, then scalar-quantized (turbo8: 8-bit absmax grid;
+turbo4: 4-bit Lloyd-Max) or trellis-quantized (turbo3_tcq / turbo2_tcq: Viterbi
+over a convolutional codebook). One fp16 norm scalar per group carries the
+group magnitude.
+
+| Codec | Bits/value | K+V compression vs f16 | Quality |
+|---|---|---|---|
+| turbo8 | 8.125 | 2.0x | near-lossless at any model scale |
+| turbo4 | 4.125 | 3.9x | calibrated on 27B+; degrades past ~10 decode tokens on 14B-class |
+| turbo3_tcq | 3.25 | 4.9x | 27B+; TCQ bitstream is byte-exact vs the torch oracle |
+| turbo2_tcq | 2.25 | 7.1x | 27B+; experimental |
+
+Constraints: head_dim % 128 == 0 (one rotation group per 128 values —
+wider heads such as Qwen3.6-35B's 256-dim full-attention heads carry
+independent groups), page_size 1, CUDA. Hybrid GDN models (qwen3.5/3.6)
+are supported — only the full-attention layers carry KV, so the
+compression applies to that subset; linear layers cost no KV at all.
+
+Decode reads the packed slabs directly (Triton fused-decode kernels: the
+dequant inverse rotation is folded into the query and the output
+accumulator, so per-token decode work is byte-unpack + dot). Prefill goes
+through a dequantizing materializer. Use `--attention-backend triton` with
+turbo codecs: it is the only backend with the fused decode and CUDA-graph
+capture; fi/fa materialize in the decode path and force graphs off.
+
+With `--kv-codec-tune innerq`, per-channel K/V scales are calibrated over the
+first ~2048 stored tokens and channels are equalized before quantization —
+recovers accuracy when a few channels dominate the group (common on
+anisotropic K).
+
+Tensor parallelism needs no special handling: KV slabs are per-rank (kv heads
+split across ranks), quantization is per-128-group and never crosses heads, and
+InnerQ scales are per-rank — each rank calibrates from its own heads'
+statistics, which is correct since scales are decode-local.
+
 ## Notes
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into

@@ -24,7 +24,7 @@ class CacheManagerCreator(Protocol):
 SUPPORTED_CACHE_MANAGER = Registry[CacheManagerCreator]("Cache Manager")
 
 
-def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
+def resolve_pool_class(model_config: ModelConfig, kv_codec: str = "f16") -> type[BaseKVCachePool]:
     """attn_type -> KV pool family, the dispatch shared by ``create_kv_pool`` and the
     engine's pre-pool sizing calls (the classmethod cost/solve surface). Driven by the
     group-spec walk (same source as the backend capability matrix); getattr fallbacks
@@ -37,6 +37,10 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
             from .dsv4_paged_pool import DSV4PagedKVCache
 
             return DSV4PagedKVCache
+        if kv_codec != "f16":
+            from .turbo_pool import TurboKVCache
+
+            return TurboKVCache
         from .mha_pool import MHAKVCache
 
         return MHAKVCache
@@ -71,10 +75,13 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
         from .bsa_pool import BSAKVCache
 
         return BSAKVCache
+    if kv_codec != "f16":
+        from .turbo_pool import TurboKVCache
+
+        return TurboKVCache
     from .mha_pool import MHAKVCache
 
     return MHAKVCache
-
 
 def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dtype):
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
@@ -85,7 +92,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     from .dsv4_paged_pool import DSV4PagedKVCache
 
     model_config = config.model_config
-    if resolve_pool_class(model_config) is DSV4PagedKVCache:
+    if resolve_pool_class(model_config, kv_codec=getattr(config, "kv_codec", "f16")) is DSV4PagedKVCache:
         # DSV4 is driven by the generic CacheManager over the shared page table; the pool is
         # the only DSV4-specific piece (the swa_pool plug-in: window tier + cmp/idx/state
         # shadows). Sizing reads dsv4_args, never the group spec.
@@ -117,6 +124,8 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        kv_codec=getattr(config, "kv_codec", "f16"),
+        kv_codec_tune=getattr(config, "kv_codec_tune", "none"),
     )
 
 
@@ -128,6 +137,8 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    kv_codec: str = "f16",
+    kv_codec_tune: str = "none",
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -152,6 +163,16 @@ def create_kvcache_pool(
     # slabs.
     layer_ids: tuple[int, ...] | None = None
     kv_specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
+    # The MTP draft head's KV rows live at layer index num_layers (one per
+    # mtp layer) — the extended full-attn group's layer_ids include them, so
+    # every pool path's global-id validation bound must cover them. The bound
+    # is bookkeeping only: storage stays len(layer_ids).
+    n_pool_layers = max(
+        model_config.num_layers,
+        len(layer_ids) if layer_ids is not None else 0,
+        model_config.num_layers
+        + (getattr(model_config, "mtp_num_hidden_layers", 0) or 0),
+    )
     if model_config.has_linear_attention:
         assert len(kv_specs) == 1, (
             f"hybrid-linear models support one paged-KV group, got "
@@ -193,7 +214,7 @@ def create_kvcache_pool(
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
-            num_layers=model_config.num_layers,
+            num_layers=n_pool_layers,
             head_dim=spec.head_dim,
             num_pages=num_pages,
             page_size=page_size,
@@ -247,11 +268,28 @@ def create_kvcache_pool(
         )
 
     spec = kv_specs[0] if len(kv_specs) == 1 else None
+    if kv_codec != "f16":
+        from .turbo_pool import TurboKVCache
+
+        pool = TurboKVCache(
+            num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
+            num_pages=num_pages,
+            page_size=page_size,
+            num_layers=n_pool_layers,
+            head_dim=spec.head_dim if spec is not None else model_config.head_dim,
+            device=device,
+            dtype=dtype,
+            codec=kv_codec,
+            layer_ids=layer_ids,
+        )
+        if kv_codec_tune == "innerq":
+            pool.arm_innerq_calibration()
+        return pool
     return MHAKVCache(
         num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
-        num_layers=model_config.num_layers,
+        num_layers=n_pool_layers,
         head_dim=spec.head_dim if spec is not None else model_config.head_dim,
         device=device,
         dtype=dtype,

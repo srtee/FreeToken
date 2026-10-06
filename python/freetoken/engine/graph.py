@@ -8,6 +8,9 @@ import torch
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.utils import init_logger, mem_GB
+
+if TYPE_CHECKING:
+    from freetoken.attention.triton import TritonAttentionBackend
 from freetoken.utils.progress import emit_progress
 from tqdm import tqdm
 
@@ -144,6 +147,23 @@ class GraphRunner:
         # reads it as an indeterminate phase and animates the bar. Must precede the
         # graphs-disabled early return so that config gets the phase too.
         emit_progress("Capturing CUDA graphs / warming up", 0, 0)
+        # TurboQuant/TCQ pools: the materializer inside forward breaks
+        # capture (illegal access under flashinfer's paged kernels). The
+        # Triton backend's wave-2 fused decode reads the packed slabs
+        # directly — decode no longer touches the materializer — so capture
+        # is safe there. Other backends keep the eager behavior.
+        kv_pool = getattr(self.attn_backend, "kvcache", None)
+        from freetoken.attention.triton import TritonAttentionBackend
+
+        if getattr(kv_pool, "is_turbo", False) and not isinstance(
+            self.attn_backend, TritonAttentionBackend
+        ):
+            self.max_graph_bs = 0
+            self.graph_bs_list = []
+            return logger.info_rank0(
+                "CUDA graph is disabled: --kv-codec turbo pool materialization "
+                "is not capture-safe on this attention backend (triton enables it)."
+            )
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")

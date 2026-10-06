@@ -271,6 +271,391 @@ def _decode_grouped_stage1_kernel(
 
 
 @triton.jit
+def _turbo_fwht128(x, D128: tl.constexpr, LEAD: tl.constexpr,
+                   LEAD_DIM: tl.constexpr, LEAD_DIM2: tl.constexpr):
+    """Unnormalized 128-point Hadamard along the LAST axis (shape
+    (LEAD..., 128)). Seven unrolled reshape/trans/split stages, one
+    per index bit (order-free: per-bit stage matrices commute)."""
+    if LEAD == 1:
+        y = tl.reshape(x, (LEAD_DIM, 64, 2, 1))
+        y = tl.trans(y, 0, 1, 3, 2)
+        a, b = tl.split(y)
+        y = tl.join(a + b, a - b)
+        y = tl.trans(y, 0, 1, 3, 2)
+        x = tl.reshape(y, (LEAD_DIM, D128))
+        y = tl.reshape(x, (LEAD_DIM, 32, 2, 2))
+        y = tl.trans(y, 0, 1, 3, 2)
+        a, b = tl.split(y)
+        y = tl.join(a + b, a - b)
+        y = tl.trans(y, 0, 1, 3, 2)
+        x = tl.reshape(y, (LEAD_DIM, D128))
+        y = tl.reshape(x, (LEAD_DIM, 16, 2, 4))
+        y = tl.trans(y, 0, 1, 3, 2)
+        a, b = tl.split(y)
+        y = tl.join(a + b, a - b)
+        y = tl.trans(y, 0, 1, 3, 2)
+        x = tl.reshape(y, (LEAD_DIM, D128))
+        y = tl.reshape(x, (LEAD_DIM, 8, 2, 8))
+        y = tl.trans(y, 0, 1, 3, 2)
+        a, b = tl.split(y)
+        y = tl.join(a + b, a - b)
+        y = tl.trans(y, 0, 1, 3, 2)
+        x = tl.reshape(y, (LEAD_DIM, D128))
+        y = tl.reshape(x, (LEAD_DIM, 4, 2, 16))
+        y = tl.trans(y, 0, 1, 3, 2)
+        a, b = tl.split(y)
+        y = tl.join(a + b, a - b)
+        y = tl.trans(y, 0, 1, 3, 2)
+        x = tl.reshape(y, (LEAD_DIM, D128))
+        y = tl.reshape(x, (LEAD_DIM, 2, 2, 32))
+        y = tl.trans(y, 0, 1, 3, 2)
+        a, b = tl.split(y)
+        y = tl.join(a + b, a - b)
+        y = tl.trans(y, 0, 1, 3, 2)
+        x = tl.reshape(y, (LEAD_DIM, D128))
+        y = tl.reshape(x, (LEAD_DIM, 1, 2, 64))
+        y = tl.trans(y, 0, 1, 3, 2)
+        a, b = tl.split(y)
+        y = tl.join(a + b, a - b)
+        y = tl.trans(y, 0, 1, 3, 2)
+        x = tl.reshape(y, (LEAD_DIM, D128))
+        return x
+    else:
+        y = tl.reshape(x, (LEAD_DIM, LEAD_DIM2, 64, 2, 1))
+        y = tl.trans(y, 0, 1, 2, 4, 3)
+        a, b = tl.split(y)
+        y = tl.join(a + b, a - b)
+        y = tl.trans(y, 0, 1, 2, 4, 3)
+        x = tl.reshape(y, (LEAD_DIM, LEAD_DIM2, D128))
+        y = tl.reshape(x, (LEAD_DIM, LEAD_DIM2, 32, 2, 2))
+        y = tl.trans(y, 0, 1, 2, 4, 3)
+        a, b = tl.split(y)
+        y = tl.join(a + b, a - b)
+        y = tl.trans(y, 0, 1, 2, 4, 3)
+        x = tl.reshape(y, (LEAD_DIM, LEAD_DIM2, D128))
+        y = tl.reshape(x, (LEAD_DIM, LEAD_DIM2, 16, 2, 4))
+        y = tl.trans(y, 0, 1, 2, 4, 3)
+        a, b = tl.split(y)
+        y = tl.join(a + b, a - b)
+        y = tl.trans(y, 0, 1, 2, 4, 3)
+        x = tl.reshape(y, (LEAD_DIM, LEAD_DIM2, D128))
+        y = tl.reshape(x, (LEAD_DIM, LEAD_DIM2, 8, 2, 8))
+        y = tl.trans(y, 0, 1, 2, 4, 3)
+        a, b = tl.split(y)
+        y = tl.join(a + b, a - b)
+        y = tl.trans(y, 0, 1, 2, 4, 3)
+        x = tl.reshape(y, (LEAD_DIM, LEAD_DIM2, D128))
+        y = tl.reshape(x, (LEAD_DIM, LEAD_DIM2, 4, 2, 16))
+        y = tl.trans(y, 0, 1, 2, 4, 3)
+        a, b = tl.split(y)
+        y = tl.join(a + b, a - b)
+        y = tl.trans(y, 0, 1, 2, 4, 3)
+        x = tl.reshape(y, (LEAD_DIM, LEAD_DIM2, D128))
+        y = tl.reshape(x, (LEAD_DIM, LEAD_DIM2, 2, 2, 32))
+        y = tl.trans(y, 0, 1, 2, 4, 3)
+        a, b = tl.split(y)
+        y = tl.join(a + b, a - b)
+        y = tl.trans(y, 0, 1, 2, 4, 3)
+        x = tl.reshape(y, (LEAD_DIM, LEAD_DIM2, D128))
+        y = tl.reshape(x, (LEAD_DIM, LEAD_DIM2, 1, 2, 64))
+        y = tl.trans(y, 0, 1, 2, 4, 3)
+        a, b = tl.split(y)
+        y = tl.join(a + b, a - b)
+        y = tl.trans(y, 0, 1, 2, 4, 3)
+        x = tl.reshape(y, (LEAD_DIM, LEAD_DIM2, D128))
+        return x
+
+
+@triton.jit
+def _turbo_unpack_coeffs(
+    blk_ptr,          # uint8 pointer to this (slot, kv_head, group) block
+    s2_ptr,
+    cb_ptr,           # codec table: 16 centroids (turbo4) or 512/256 TCQ book
+    offs_d,           # (D128,) lane indices within the group
+    CODEC: tl.constexpr,
+):
+    """Unpack one 128-value rotation group's coefficients (dequant BEFORE
+    the inverse rotation): s2 ⊙ coeff * norm. Mirrors the val computation
+    in turbo_dequant_kernel exactly (norm fp16 at bytes 0-1)."""
+    lo8 = tl.load(blk_ptr + 0).to(tl.uint16)
+    hi8 = tl.load(blk_ptr + 1).to(tl.uint16)
+    norm = ((lo8 | (hi8 << 8)).to(tl.uint16).to(tl.float16, bitcast=True)).to(tl.float32)
+    tid = offs_d % 128
+    if CODEC == 8:
+        b = tl.load(blk_ptr + 2 + tid).to(tl.float32)
+        val = (b - 127.5) / 127.5
+    elif CODEC == 4:
+        byte = tl.load(blk_ptr + 2 + (tid // 2)).to(tl.uint8)
+        idx = tl.where((tid % 2) == 0, byte & 0xF, (byte >> 4)).to(tl.int32)
+        val = tl.load(cb_ptr + idx)  # 16-entry Lloyd-Max table
+    else:
+        bits: tl.constexpr = 3 if CODEC == 32 else 2
+        bit_pos = tid * bits
+        byte_idx = bit_pos // 8
+        bit_off = bit_pos % 8
+        lo = tl.load(blk_ptr + 2 + byte_idx).to(tl.uint16)
+        hi = tl.load(blk_ptr + 2 + byte_idx + 1).to(tl.uint16)
+        raw = lo | (hi << 8)
+        state = ((raw >> bit_off) & ((1 << (6 + bits)) - 1)).to(tl.int32)
+        val = tl.load(cb_ptr + state)  # 512/256-entry TCQ book
+    s2 = tl.load(s2_ptr + tid)
+    return s2 * val * norm
+
+
+@triton.jit
+def _BB(CODEC: tl.constexpr):
+    """Block bytes per codec: turbo8=130, turbo4=66, turbo3_tcq=52."""
+    if CODEC == 8:
+        return 130
+    elif CODEC == 4:
+        return 66
+    else:
+        return 52
+
+@triton.jit
+def _decode_grouped_stage1_kernel_turbo(
+    q_ptr,
+    k_slab_ptr,       # (tokens, kv_heads*G, BB) uint8 packed K
+    v_slab_ptr,
+    sm_scale,
+    indptr_ptr,
+    indices_ptr,
+    q_pos_ptr,
+    mid_o_ptr,
+    mid_lse_ptr,
+    num_kv_splits_ptr,
+    s1_ptr,           # [128] f32 FWHT sign tables
+    s2_ptr,
+    scale_inv_ptr,    # [128] f32 InnerQ inverse scales
+    cbk_ptr,          # K codec table (16/256/512 f32)
+    cbv_ptr,
+    stride_qt,
+    stride_qh,
+    stride_ks,        # slab row stride, in BYTES (uint8 elements)
+    stride_kh,        # kv-head stride within a slab row, in BYTES
+    stride_vs,
+    stride_vh,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    stride_lse_b,
+    stride_lse_h,
+    stride_lse_s,
+    GROUP: tl.constexpr,
+    NUM_Q_HEADS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    VALID_BLOCK_H: tl.constexpr,
+    MIN_BLOCK_KV: tl.constexpr,
+    D: tl.constexpr,       # head_dim (128 or 256)
+    DV: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+    CODEC: tl.constexpr,   # 8=turbo8, 4=turbo4, 32=turbo3_tcq
+):
+    """Split-k grouped decode over PACKED KV slabs: per KV row the 128-
+    value rotation groups are unpacked to rotated-domain coefficients
+    (s2 ⊙ coeff * norm); the dequant inverse rotation is folded into the
+    query prologue (K) and the stage-2 epilogue (V). Partials are stored
+    in the ROTATED domain — stage 2 must use the _turbo variant."""
+    batch_id = tl.program_id(0)
+    head_block_id = tl.program_id(1)
+    split_id = tl.program_id(2)
+
+    kv_head = head_block_id // tl.cdiv(GROUP, VALID_BLOCK_H)
+    q_heads = head_block_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_h = q_heads < (head_block_id + 1) * VALID_BLOCK_H
+    mask_h = mask_h & (q_heads < NUM_Q_HEADS)
+
+    offs_d = tl.arange(0, BLOCK_D)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < D
+    mask_dv = offs_dv < DV
+
+    kv_start = tl.load(indptr_ptr + batch_id)
+    kv_len = tl.load(indptr_ptr + batch_id + 1) - kv_start
+    q_pos = tl.load(q_pos_ptr + batch_id)
+    effective_end = tl.minimum(kv_len, q_pos + 1)
+    effective_start = 0
+    if SLIDING_WINDOW > 0:
+        effective_start = tl.maximum(0, q_pos - SLIDING_WINDOW + 1)
+    effective_len = tl.maximum(0, effective_end - effective_start)
+
+    kv_splits = tl.load(num_kv_splits_ptr + batch_id)
+    kv_len_per_split = (
+        tl.cdiv(tl.cdiv(effective_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    )
+    split_start = kv_len_per_split * split_id
+    split_end = tl.minimum(split_start + kv_len_per_split, effective_len)
+
+    m_i = tl.zeros((BLOCK_H,), dtype=tl.float32) - float("inf")
+    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_H, BLOCK_DV), dtype=tl.float32)  # rotated domain
+
+    # ---- prologue: fold the inverse rotation + InnerQ scales into q ----
+    # score_j = q_j * decode(c_k)_j * scale_inv_j
+    #        = kInvSqrt128 * [B(s1 ⊙ (scale_inv ⊙ q))]_j * (s2 ⊙ c_k)_j
+    q_raw = tl.load(q_ptr + batch_id * stride_qt + q_heads[:, None] * stride_qh
+                    + offs_d[None, :], mask=mask_h[:, None] & mask_d[None, :],
+                    other=0.0).to(tl.float32)
+    si = tl.load(scale_inv_ptr + (offs_d % 128))
+    s1v = tl.load(s1_ptr + (offs_d % 128))
+    q_eff = q_raw * si[None, :] * s1v[None, :]
+    # butterfly along the last axis in 128-chunks (D is a multiple of 128)
+    q_rot = _turbo_fwht128(tl.reshape(q_eff, (BLOCK_H, D // 128, 128)), 128, 2,
+                            BLOCK_H, D // 128)
+    q_rot = tl.reshape(q_rot, (BLOCK_H, BLOCK_D)) * 0.08838834764831845
+
+    if split_end > split_start:
+        for rel_start in tl.range(split_start, split_end, BLOCK_N):
+            rel_offs = rel_start + tl.arange(0, BLOCK_N)
+            mask_n = rel_offs < split_end
+            logical_offs = effective_start + rel_offs
+            slots = tl.load(indices_ptr + kv_start + logical_offs,
+                            mask=mask_n, other=0)
+
+            # unpack K coefficients: (BLOCK_N, BLOCK_D) rotated domain
+            lane = offs_d % 128
+            grp = offs_d // 128  # rotation-group index within the head
+            head_grp = kv_head * (D // 128) + grp
+            k_blk_base = slots[:, None] * stride_ks                 + head_grp[None, :] * _BB(CODEC)
+            kcoef = _turbo_unpack_coeffs(
+                k_slab_ptr + k_blk_base, s2_ptr, cbk_ptr, lane, CODEC)
+            # mask lanes beyond D: coefficients of masked lanes read slot 0
+            # — zero them so they never affect scores.
+            kcoef = tl.where(mask_d[None, :], kcoef, 0.0)
+            # scores[h, n] = kInvSqrt * sum_d q_rot[h,d] * kcoef[n,d]
+            scores = tl.dot(q_rot, tl.trans(kcoef), input_precision="ieee")
+            scores = scores * sm_scale
+            scores = tl.where(mask_h[:, None] & mask_n[None, :], scores,
+                              -float("inf"))
+
+            m_new = tl.maximum(tl.max(scores, axis=1), m_i)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new[:, None])
+
+            head_grp = kv_head * (D // 128) + grp
+            v_blk_base = slots[:, None] * stride_vs                 + head_grp[None, :] * _BB(CODEC)
+            vcoef = _turbo_unpack_coeffs(
+                v_slab_ptr + v_blk_base, s2_ptr, cbv_ptr, lane, CODEC)
+            vcoef = tl.where(mask_dv[None, :], vcoef, 0.0)
+            # accumulate in the ROTATED domain: acc += p @ vcoef
+            acc = acc * alpha[:, None] + tl.dot(p, vcoef, input_precision="ieee")
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            m_i = m_new
+
+        out = acc / l_i[:, None]
+        mid_offsets = (
+            batch_id * stride_mid_ob
+            + q_heads[:, None] * stride_mid_oh
+            + split_id * stride_mid_os
+            + offs_dv[None, :]
+        )
+        tl.store(mid_o_ptr + mid_offsets, out, mask=mask_h[:, None] & mask_dv[None, :])
+
+        lse_offsets = (
+            batch_id * stride_lse_b
+            + q_heads * stride_lse_h
+            + split_id * stride_lse_s
+        )
+        tl.store(mid_lse_ptr + lse_offsets, m_i + tl.log(l_i), mask=mask_h)
+
+
+
+
+@triton.jit
+def _decode_stage2_kernel_turbo(
+    mid_o_ptr,
+    mid_lse_ptr,
+    o_ptr,
+    indptr_ptr,
+    q_pos_ptr,
+    num_kv_splits_ptr,
+    sinks_ptr,
+    s1_ptr,
+    scale_inv_ptr,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    stride_lse_b,
+    stride_lse_h,
+    stride_lse_s,
+    stride_ot,
+    stride_oh,
+    MAX_KV_SPLITS: tl.constexpr,
+    MIN_BLOCK_KV: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    DV: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
+):
+    """Combine the rotated-domain split partials, then undo the rotation:
+    out = kInvSqrt128 * s1 ⊙ scale_inv ⊙ B(acc_combined) / l. The softmax
+    combine is linear so it commutes with the butterfly."""
+    batch_id = tl.program_id(0)
+    q_head = tl.program_id(1)
+
+    kv_len = tl.load(indptr_ptr + batch_id + 1) - tl.load(indptr_ptr + batch_id)
+    q_pos = tl.load(q_pos_ptr + batch_id)
+    effective_end = tl.minimum(kv_len, q_pos + 1)
+    effective_start = 0
+    if SLIDING_WINDOW > 0:
+        effective_start = tl.maximum(0, q_pos - SLIDING_WINDOW + 1)
+    effective_len = tl.maximum(0, effective_end - effective_start)
+
+    kv_splits = tl.load(num_kv_splits_ptr + batch_id)
+    kv_len_per_split = (
+        tl.cdiv(tl.cdiv(effective_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
+    )
+
+    offs_d = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < DV
+    if HAS_SINKS:
+        m_i = tl.load(sinks_ptr + q_head).to(tl.float32)
+        l_i = 1.0
+    else:
+        m_i = -float("inf")
+        l_i = 0.0
+    acc = tl.zeros((BLOCK_DV,), dtype=tl.float32)
+
+    mid_base = batch_id * stride_mid_ob + q_head * stride_mid_oh + offs_d
+    lse_base = batch_id * stride_lse_b + q_head * stride_lse_h
+
+    for split_id in tl.range(0, MAX_KV_SPLITS, num_stages=2):
+        split_start = kv_len_per_split * split_id
+        split_end = tl.minimum(split_start + kv_len_per_split, effective_len)
+
+        if split_end > split_start:
+            partial = tl.load(
+                mid_o_ptr + mid_base + split_id * stride_mid_os,
+                mask=mask_d,
+                other=0.0,
+            )
+            partial_lse = tl.load(mid_lse_ptr + lse_base + split_id * stride_lse_s)
+            m_new = tl.maximum(partial_lse, m_i)
+            alpha = tl.exp(m_i - m_new)
+            beta = tl.exp(partial_lse - m_new)
+            acc = acc * alpha + partial * beta
+            l_i = l_i * alpha + beta
+            m_i = m_new
+
+    out = tl.where(l_i == 0.0, 0.0, acc / l_i)
+    # inverse rotation + InnerQ unscale on the combined vector
+    lane = offs_d % 128
+    out = _turbo_fwht128(tl.reshape(out, (DV // 128, 128)), 128, 1, DV // 128, 0)
+    out = tl.reshape(out, (BLOCK_DV,))
+    si = tl.load(scale_inv_ptr + lane)
+    s1v = tl.load(s1_ptr + lane)
+    out = out * 0.08838834764831845 * s1v * si
+    tl.store(
+        o_ptr + batch_id * stride_ot + q_head * stride_oh + offs_d,
+        out.to(o_ptr.dtype.element_ty),
+        mask=mask_d,
+    )
+
+
+@triton.jit
 def _decode_stage2_kernel(
     mid_o_ptr,
     mid_lse_ptr,
@@ -446,6 +831,122 @@ def decode_paged_attention(
         q_positions,
         num_kv_splits,
         sinks_arg,
+        attn_logits.stride(0),
+        attn_logits.stride(1),
+        attn_logits.stride(2),
+        attn_lse.stride(0),
+        attn_lse.stride(1),
+        attn_lse.stride(2),
+        o.stride(0),
+        o.stride(1),
+        MAX_KV_SPLITS=max_kv_splits,
+        MIN_BLOCK_KV=_MIN_BLOCK_KV,
+        BLOCK_DV=block_dv,
+        DV=head_dim,
+        SLIDING_WINDOW=sliding_window or 0,
+        HAS_SINKS=sinks is not None,
+        num_warps=4,
+        num_stages=2,
+    )
+    return o
+
+
+def decode_paged_attention_turbo(
+    q: torch.Tensor,
+    k_slab: torch.Tensor,      # (tokens, kv_heads*G, BB) uint8
+    v_slab: torch.Tensor,
+    indptr: torch.Tensor,
+    indices: torch.Tensor,
+    q_positions: torch.Tensor,
+    attn_logits: torch.Tensor,
+    attn_lse: torch.Tensor,
+    num_kv_splits: torch.Tensor,
+    max_kv_splits: int,
+    sm_scale: float,
+    aux: dict,                 # pool.decode_aux(): s1/s2/scale_inv/codebook_*/centroids4
+    codec: str,
+    sliding_window: int | None = None,
+    sinks: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Split-k grouped decode straight off the packed KV slabs (wave-2
+    fused decode): the dequant inverse rotation is folded into the query
+    prologue and the stage-2 epilogue, so no materializer runs on the
+    decode path and CUDA-graph capture is safe."""
+    CODEC_ID = {"turbo8": 8, "turbo4": 4, "turbo3_tcq": 32, "turbo2_tcq": 22}[codec]
+    bb = {"turbo8": 130, "turbo4": 66, "turbo3_tcq": 52, "turbo2_tcq": 36}[codec]
+    assert q.is_cuda and k_slab.is_cuda
+    batch, num_q_heads, head_dim = q.shape
+    assert head_dim % 128 == 0
+    num_kv_heads = k_slab.shape[1] // (head_dim // 128)
+    assert num_q_heads % num_kv_heads == 0
+    assert batch == indptr.numel() - 1
+    cbk = aux["centroids4"] if codec == "turbo4" else aux["codebook_k"]
+    cbv = aux["centroids4"] if codec == "turbo4" else aux["codebook_v"]
+
+    o = out if out is not None else torch.empty_like(q)
+    sinks_arg = sinks if sinks is not None else q
+    group = num_q_heads // num_kv_heads
+    valid_block_h = min(16, group)
+    block_h = triton.next_power_of_2(valid_block_h)
+    block_d = triton.next_power_of_2(head_dim)
+    block_dv = triton.next_power_of_2(head_dim)
+
+    _decode_grouped_stage1_kernel_turbo[
+        (batch, triton.cdiv(num_q_heads, valid_block_h), max_kv_splits)
+    ](
+        q,
+        k_slab,
+        v_slab,
+        sm_scale,
+        indptr,
+        indices,
+        q_positions,
+        attn_logits,
+        attn_lse,
+        num_kv_splits,
+        aux["s1"],
+        aux["s2"],
+        aux["scale_inv"],
+        cbk,
+        cbv,
+        q.stride(0),
+        q.stride(1),
+        k_slab.stride(0),      # bytes (uint8)
+        k_slab.stride(1),
+        v_slab.stride(0),
+        v_slab.stride(1),
+        attn_logits.stride(0),
+        attn_logits.stride(1),
+        attn_logits.stride(2),
+        attn_lse.stride(0),
+        attn_lse.stride(1),
+        attn_lse.stride(2),
+        GROUP=group,
+        NUM_Q_HEADS=num_q_heads,
+        BLOCK_D=block_d,
+        BLOCK_DV=block_dv,
+        BLOCK_N=16,
+        BLOCK_H=block_h,
+        VALID_BLOCK_H=valid_block_h,
+        MIN_BLOCK_KV=_MIN_BLOCK_KV,
+        D=head_dim,
+        DV=head_dim,
+        SLIDING_WINDOW=sliding_window or 0,
+        CODEC=CODEC_ID,
+        num_warps=4,
+        num_stages=2,
+    )
+    _decode_stage2_kernel_turbo[(batch, num_q_heads)](
+        attn_logits,
+        attn_lse,
+        o,
+        indptr,
+        q_positions,
+        num_kv_splits,
+        sinks_arg,
+        aux["s1"],
+        aux["scale_inv"],
         attn_logits.stride(0),
         attn_logits.stride(1),
         attn_logits.stride(2),

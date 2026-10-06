@@ -164,7 +164,17 @@ def cache_status_rows(geometry: dict) -> List[Tuple[str, str, int, str]]:
         rows.append(_row("moe", detail))
     kv_pages = _int(geometry, "num_pages")
     if kv_pages > 0:
-        rows.append(_row("kv", format_tokens(kv_pages, page_size)))
+        detail = format_tokens(kv_pages, page_size)
+        codec = str((geometry or {}).get("kv_codec") or "f16")
+        if codec != "f16":
+            detail += f", codec={codec}"
+            tune = str((geometry or {}).get("kv_codec_tune") or "none")
+            if tune != "none":
+                detail += f" (tune={tune}"
+                if (geometry or {}).get("innerq_calibrated"):
+                    detail += ", calibrated"
+                detail += ")"
+        rows.append(_row("kv", detail))
     mamba = _int(geometry, "num_mamba_slots")
     if mamba > 0:  # hybrid (GDN) models only
         rows.append(_row("mamba", f"{mamba} slots"))

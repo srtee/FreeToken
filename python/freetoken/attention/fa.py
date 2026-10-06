@@ -67,10 +67,16 @@ class FlashAttentionBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, FAMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        pool = self.kvcache
+        if getattr(pool, "is_turbo", False):
+            k_cache, v_cache = pool.materialize(layer_id, metadata.page_table, metadata.cache_seqlens)
+        else:
+            k_cache = self.kvcache.k_cache(layer_id)
+            v_cache = self.kvcache.v_cache(layer_id)
         return _fa_sgl_impl(
             q=q,
-            k_cache=self.kvcache.k_cache(layer_id),
-            v_cache=self.kvcache.v_cache(layer_id),
+            k_cache=k_cache,
+            v_cache=v_cache,
             page_table=metadata.page_table,
             cache_seqlens=metadata.cache_seqlens,
             cu_seqlens_q=metadata.cu_seqlens_q,
