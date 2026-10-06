@@ -180,6 +180,8 @@ class Qwen4ExpMTPHead(BaseOP):
             config, use_combine=False, prefix=f"{prefix}.hyper_connection_mixer")
         self.layer = Qwen4ExpMTPDraftLayer(
             config, config.num_layers, prefix=f"{prefix}.layer")
+        # Set by engine/spec_mtp MTPDrafter under --draft-vocab; see load_draft_vocab.
+        self.draft_vocab_mask: torch.Tensor | None = None
 
     def set_lm_head(self, lm_head) -> None:
         self._lm_head = lm_head
@@ -237,8 +239,13 @@ class Qwen4ExpMTPHead(BaseOP):
 
     def draft_step(self, carry: torch.Tensor, input_ids: torch.Tensor):
         """``(carry, logits)`` of the next draft position; spec_mtp samples and
-        feeds the next carry."""
-        return self.forward_rows(carry, input_ids, with_logits=True)
+        feeds the next carry. draft_vocab_mask (-inf bool [V], installed by
+        MTPDrafter under --draft-vocab) restricts what the callers' argmax can
+        propose; greedy output stays byte-identical to plain decode."""
+        carry, logits = self.forward_rows(carry, input_ids, with_logits=True)
+        if self.draft_vocab_mask is not None:
+            logits = logits.masked_fill(self.draft_vocab_mask, float("-inf"))
+        return carry, logits
 
 
 __all__ = ["Qwen4ExpMTPDraftLayer", "Qwen4ExpMTPHead", "Qwen4ExpMTPMoE"]

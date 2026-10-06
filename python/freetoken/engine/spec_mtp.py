@@ -23,7 +23,9 @@ hook cloning the decode batch's bookkeeping.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 
@@ -204,6 +206,77 @@ def commit_reqs(reqs, result: SpecResult) -> None:
             f"spec loop invariant violated: last emitted token "
             f"{req.input_ids[-1].item()} != next input {next_input[i]}")
 
+# ---------------------------------------------------------------------------
+# --draft-vocab
+# ---------------------------------------------------------------------------
+
+_DRAFT_VOCAB_DIR = Path(__file__).resolve().parent / "draft_vocab"
+BUILTIN_DRAFT_VOCABS = ("en-code", "cyrillic", "cjk")
+
+
+def load_draft_vocab(spec: str, tokenizer_len: int, logits_width: int,
+                     device) -> torch.Tensor | None:
+    """Resolve --draft-vocab to a persistent bool mask over the vocabulary.
+
+    The MTP head -inf-masks its draft logits with this before the callers'
+    argmax (the scheduler's eager loop, the graphed draft, MTPDrafter.draft):
+    True marks a BANNED id (everything outside the subset), so drafting can
+    only propose subset tokens. Lossless by construction:
+    a trunk token outside the subset simply rejects its draft.
+
+    Two widths, deliberately distinct: ``tokenizer_len`` (what
+    ``len(tokenizer)`` reports) is the artifact-identity check — a subset
+    built for any other tokenizer carries a different count and is refused —
+    while ``logits_width`` (the model config's vocab_size, which may hold
+    reserved ids beyond the tokenizer's, e.g. Qwen3.6: 248320 vs 248077)
+    is the mask tensor's width; the reserved tail stays unmaskable.
+
+    ``spec`` is "full" (or ""), a built-in subset name from
+    python/freetoken/engine/draft_vocab/ (built by scripts/draft_vocab.py),
+    or a path to a subset .json. Raises ValueError on malformed artifacts so
+    a stale build fails at startup, not as silent garbage proposals.
+    """
+    if spec in ("", "full"):
+        return None
+    path = (Path(spec) if ("/" in spec or spec.endswith(".json"))
+            else _DRAFT_VOCAB_DIR / f"{spec}.json")
+    try:
+        art = json.loads(path.read_text())
+    except FileNotFoundError:
+        raise ValueError(
+            f"--draft-vocab {spec!r}: not a built-in subset ({BUILTIN_DRAFT_VOCABS}) "
+            "and no such file") from None
+    except ValueError:
+        raise ValueError(f"--draft-vocab {spec!r}: {path} is not valid JSON") from None
+    ids = art.get("ids") if isinstance(art, dict) else art
+    if not isinstance(ids, list) or not all(isinstance(v, int) and not isinstance(v, bool) for v in ids):
+        raise ValueError(f"--draft-vocab {spec!r}: 'ids' must be a list of ints")
+    if ids != sorted(set(ids)):
+        raise ValueError(f"--draft-vocab {spec!r}: ids must be sorted and unique")
+    built = art.get("vocab_size") if isinstance(art, dict) else tokenizer_len
+    if built != tokenizer_len:
+        raise ValueError(
+            f"--draft-vocab {spec!r}: artifact was built for a {built}-id "
+            f"tokenizer, this model's has {tokenizer_len} — rebuild with "
+            "scripts/draft_vocab.py for this tokenizer")
+    if tokenizer_len > logits_width:
+        raise ValueError(
+            f"--draft-vocab {spec!r}: tokenizer len {tokenizer_len} exceeds "
+            f"the draft logits width {logits_width}")
+    mask = torch.ones(logits_width, dtype=torch.bool, device=device)
+    mask[torch.tensor(ids, dtype=torch.int64)] = False
+    return mask
+
+
+def _tokenizer_len(model_path: str) -> int:
+    """``len(tokenizer)`` for the checkpoint — the artifact-identity anchor
+    for --draft-vocab (load_draft_vocab); distinct from the config's padded
+    vocab_size on several families (Qwen3.6: 248077 vs 248320)."""
+    from transformers import AutoTokenizer
+
+    return len(AutoTokenizer.from_pretrained(model_path))
+
+
 class MTPDrafter:
     """The MTP draft step's engine-side owner: stats + the batched eager
     draft call. Built once at engine init under --spec-mtp.
@@ -229,6 +302,15 @@ class MTPDrafter:
         self.mtp = engine.model.model.mtp
         assert self.mtp is not None, "--spec-mtp requires an MTP-capable checkpoint"
         self.stats = SpecStats()
+        # --draft-vocab: install the -inf mask on the head BEFORE any graph
+        # capture; draft_step applies it for every draft path (eager loop,
+        # graphed draft, this eager reference).
+        self.draft_vocab_mask = load_draft_vocab(
+            engine.config.draft_vocab,
+            _tokenizer_len(engine.config.model_path),
+            engine.config.model_config.vocab_size,
+            engine.device)
+        self.mtp.draft_vocab_mask = self.draft_vocab_mask
 
     def draft(self, carry: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
         """One batched draft step: [B, H] carries (the trunk's post-norm

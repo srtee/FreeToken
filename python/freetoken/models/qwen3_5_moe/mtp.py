@@ -174,6 +174,8 @@ class MTPHead(BaseOP):
                                    prefix="model.mtp.fc")
         self.norm = GemmaRMSNorm(hidden, eps=config.rms_norm_eps)
         self.layer = MTPDraftLayer(config, layer_id, dtype)
+        # Set by engine/spec_mtp MTPDrafter under --draft-vocab; see load_draft_vocab.
+        self.draft_vocab_mask: torch.Tensor | None = None
 
     def set_lm_head(self, lm_head) -> None:
         self._lm_head = lm_head
@@ -209,8 +211,15 @@ class MTPHead(BaseOP):
     def draft_step(self, last_hidden_normed: torch.Tensor,
                    input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """One draft step: embed+carry -> fc -> layer -> norm. Returns
-        (carry, logits). The caller samples and feeds the next carry."""
-        return self.forward_rows(last_hidden_normed, input_ids, with_logits=True)
+        (carry, logits). The caller samples and feeds the next carry.
+        draft_vocab_mask (engine/spec_mtp load_draft_vocab), when set,
+        -inf-masks the logits so the callers' argmax can only propose
+        subset tokens; a trunk token outside the subset simply rejects
+        its draft, so greedy output stays byte-identical to plain decode."""
+        carry, logits = self.forward_rows(last_hidden_normed, input_ids, with_logits=True)
+        if self.draft_vocab_mask is not None:
+            logits = logits.masked_fill(self.draft_vocab_mask, float("-inf"))
+        return carry, logits
 
 
 class MTPAttention(BaseOP):

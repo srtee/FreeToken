@@ -109,6 +109,9 @@ class EngineConfig:
     # The verify runs n+1 sequential 1-row batches per request either way;
     # only the scheduler's advance span and the resolve grow with n.
     spec_draft_n: int = 1
+    # MTP draft vocab restriction (--draft-vocab): "full" or a subset name/path.
+    # Only narrows what the draft head may propose; greedy verify stays lossless.
+    draft_vocab: str = "full"
     # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
@@ -118,6 +121,8 @@ class EngineConfig:
         if self.spec_mtp and not 1 <= self.spec_draft_n <= 2:
             raise ValueError(
                 f"--spec-draft-n {self.spec_draft_n} unsupported: stage 4 gates depth 1-2")
+        if self.draft_vocab != "full" and not self.spec_mtp:
+            raise ValueError("--draft-vocab requires --spec-mtp")
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":

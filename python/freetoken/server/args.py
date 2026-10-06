@@ -470,6 +470,15 @@ def parse_args(
         "output stays byte-identical to plain greedy decode.",
     )
     parser.add_argument(
+        "--draft-vocab",
+        default=ServerArgs.draft_vocab,
+        help="Restrict MTP draft proposals to a vocabulary subset "
+        "(requires --spec-mtp): 'full' (default), a built-in subset name "
+        "(en-code, cyrillic, cjk), or a path to a subset .json built by "
+        "scripts/draft_vocab.py. Outputs stay byte-identical to plain "
+        "greedy decode; only the acceptance rate moves.",
+    )
+    parser.add_argument(
         "--kv-codec-tune",
         type=str,
         default=ServerArgs.kv_codec_tune,
