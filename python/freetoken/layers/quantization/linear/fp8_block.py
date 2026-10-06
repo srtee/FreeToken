@@ -11,7 +11,7 @@ from ..scheme import FP8_BLOCK as BLOCK, QuantKind
 from .base import LinearConfig, LinearKernel, LinearMethod
 
 FP8 = torch.float8_e4m3fn
-E8M0 = torch.float8_e8m0fnu
+E8M0 = getattr(torch, "float8_e8m0fnu", None)  # sm70 fork: dtype added in torch 2.7; None keeps importable, e8m0 schemes rejected at create_weights
 
 
 def _e8m0(cfg: LinearConfig) -> bool:
@@ -56,5 +56,7 @@ class Fp8BlockLinearMethod(LinearMethod):
             raise ValueError(f"block-fp8 needs in/out sizes divisible by {BLOCK}, got K={g.in_features} N={g.output_sizes}")
         layer.weight = torch.empty(g.out_features, g.in_features, dtype=FP8)
         # e8m0 codes stay codes for the dsv4 kernel; float scales are bf16 as the readers push them today
+        if _e8m0(g) and E8M0 is None:
+            raise RuntimeError("e8m0 block scales need torch>=2.7 (float8_e8m0fnu); not available on the sm70 stack")
         scale_dtype = E8M0 if _e8m0(g) else torch.bfloat16
         layer.weight_scale_inv = torch.empty(g.out_features // BLOCK, g.in_features // BLOCK, dtype=scale_dtype)

@@ -8,7 +8,7 @@ from ..registry import LayerKind, register_method
 from ..scheme import MX_GROUP as GROUP, QuantKind
 from .base import BankSpec, ExpertView, fused_piece, is_resident, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
 
-E8M0 = torch.float8_e8m0fnu
+E8M0 = getattr(torch, "float8_e8m0fnu", None)  # sm70 fork: dtype added in torch 2.7; mxfp4-e8m0 banks unreachable on Volta, None keeps importable
 
 
 class TritonMxfp4MoEKernel(MoEKernel):
