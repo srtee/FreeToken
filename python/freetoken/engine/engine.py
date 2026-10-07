@@ -57,6 +57,12 @@ def _flashinfer_available() -> bool:
     return is_flashinfer_installed()
 
 
+def _sm80_or_newer() -> bool:
+    from freetoken.kernel.backend import device_capability
+
+    return device_capability() >= (8, 0)
+
+
 def _sgl_flash_attn_available() -> bool:
     try:
         from sgl_kernel.flash_attn import flash_attn_with_kvcache  # noqa: F401
@@ -117,6 +123,8 @@ def _backend_requirements_met(name: str) -> bool:
     if any(i.requires_sgl_kernel for i in infos) and not _sgl_flash_attn_available():
         return False
     if any(i.requires_sm100 for i in infos) and not is_sm100_family():
+        return False
+    if any(i.requires_sm80 for i in infos) and not _sm80_or_newer():
         return False
     return True
 
@@ -209,6 +217,15 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 f"Attention backend {config.attention_backend!r} requires flashinfer, which is "
                 "not installed. Install it with `pip install 'freetoken[fi]'` (or "
                 "'freetoken[accel]'), or use --attention-backend triton."
+            )
+        if info.requires_sm80 and not _sm80_or_newer():
+            from freetoken.kernel.backend import device_capability
+
+            major, minor = device_capability()
+            raise RuntimeError(
+                f"Attention backend {config.attention_backend!r} requires compute capability "
+                f"8.0+ (Ampere or newer): flashinfer ships no kernels for sm_{major}{minor}. "
+                "Use --attention-backend triton."
             )
         if info.requires_sgl_kernel and not _sgl_flash_attn_available():
             raise RuntimeError(

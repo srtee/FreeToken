@@ -7,6 +7,13 @@ from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.layers.quantization import QuantKind
 
 
+def _fi_usable() -> bool:
+    """Tests below hardcode the ``fi`` attention backend: flashinfer on Ampere+."""
+    from freetoken.kernel import backend
+
+    return backend.is_flashinfer_installed() and backend.device_capability() >= (8, 0)
+
+
 def _init_tp():
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
@@ -412,6 +419,10 @@ def test_lru_gpu_cache_assigns_unique_slots_for_large_miss_batch():
     assert cache.src_indices[:256].tolist() == list(range(256))
 
 
+@pytest.mark.skipif(
+    not _fi_usable(),
+    reason="hardcodes the fi attention backend: needs flashinfer on an Ampere+ GPU",
+)
 def test_adjust_config_converts_moe_cache_rate_to_cache_size(monkeypatch):
     from types import SimpleNamespace
 

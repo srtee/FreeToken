@@ -27,6 +27,7 @@ class BackendInfo:
     requires_flashinfer: bool = False
     requires_sgl_kernel: bool = False
     requires_sm100: bool = False
+    requires_sm80: bool = False
     # Allowed page sizes (None -> any). Config-time resolution coerces to the last
     # entry when the resolved page_size is not in the list.
     page_sizes: tuple[int, ...] | None = None
@@ -58,6 +59,7 @@ def create_trtllm_backend(config: ModelConfig):
     BackendInfo(
         supported_types=frozenset({AttnType.FULL}),
         requires_flashinfer=True,
+        requires_sm80=True,
     ),
 )
 def create_fi_backend(config: ModelConfig):

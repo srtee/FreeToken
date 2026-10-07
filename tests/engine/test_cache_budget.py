@@ -11,6 +11,13 @@ from freetoken.engine.cache_budget import expert_bytes_per_slot, plan_cache_budg
 from freetoken.engine.engine import _pin_budget_bytes
 
 
+def _fi_usable() -> bool:
+    """These tests hardcode the ``fi`` attention backend: flashinfer on Ampere+."""
+    from freetoken.kernel import backend
+
+    return backend.is_flashinfer_installed() and backend.device_capability() >= (8, 0)
+
+
 def test_moe_priority_fills_experts_up_to_total():
     # budget large enough to cache every expert; KV gets the remainder.
     # per_expert=100, cache_per_page=10, total=8 experts (L*E), E=4.
@@ -196,6 +203,10 @@ def test_adjust_config_rejects_num_tokens_with_num_pages():
         _adjust_config(cfg)
 
 
+@pytest.mark.skipif(
+    not _fi_usable(),
+    reason="hardcodes the fi attention backend: needs flashinfer on an Ampere+ GPU",
+)
 def test_adjust_config_resolves_num_tokens_generic():
     # Generic model keeps its page_size (1 here): tokens map 1:1 onto pages.
     from types import SimpleNamespace
@@ -389,6 +400,10 @@ def test_guard_raises_actionable_error_when_too_small():
     assert "128" in msg and "moe-cache" in msg
 
 
+@pytest.mark.skipif(
+    not _fi_usable(),
+    reason="hardcodes the fi attention backend: needs flashinfer on an Ampere+ GPU",
+)
 def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend():
     """Bare `ft serve <FTW MoE checkpoint>`: no --moe-backend, no --moe-cache-* flags at all.
 
