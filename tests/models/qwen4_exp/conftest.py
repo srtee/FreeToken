@@ -13,3 +13,8 @@ def _runtime():
     core._GLOBAL_CTX = None
     yield
     core._GLOBAL_CTX = None
+    # get_rope is functools.cached with a device-blind key; a CPU-side model build
+    # (e.g. checkpoint loader tests) must not leave its CPU rope for GPU tests to hit.
+    from freetoken.layers.rotary import get_rope
+
+    get_rope.cache_clear()
