@@ -346,7 +346,7 @@ def _bank_cache_sources(model_path: str) -> list:
 
 def _bank_cache_fingerprint(model_path, model_config, method, decode_target: str, dtype: torch.dtype) -> dict:
     mc = model_config
-    return {
+    fp = {
         "v": _BANK_CACHE_VERSION,
         "format": _resolve_bank_format(model_config, method),
         "kind": str(method.kind) if method is not None else None,
@@ -359,6 +359,17 @@ def _bank_cache_fingerprint(model_path, model_config, method, decode_target: str
         "moe_intermediate": getattr(mc, "moe_intermediate_size", None),
         "sources": _bank_cache_sources(model_path),
     }
+    # TP>1 banks are rank-local (intermediate-axis slice); scope the cache so a
+    # TP2 load never consumes the full-width banks a TP1 run stored (and vice versa)
+    try:
+        from freetoken.distributed import try_get_tp_info
+
+        tp = try_get_tp_info()
+        if tp is not None and tp.size > 1:
+            fp["tp"] = tp.size
+    except Exception:
+        pass
+    return fp
 
 
 def _bank_cache_key(fp: dict) -> str:
@@ -367,6 +378,17 @@ def _bank_cache_key(fp: dict) -> str:
 
     blob = json.dumps(fp, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def _bank_cache_candidates(model_path: str, fp: dict) -> list[str]:
+    """Cache dirs to probe, most specific first: the exact fingerprint's key dir, then
+    the TP-less key dir -- a stored full-width cache serves a TP>1 load, whose
+    ``load_ftw_banks`` carves the rank-local slice on read."""
+    root = _bank_cache_root(model_path)
+    dirs = [os.path.join(root, _bank_cache_key(fp))]
+    if "tp" in fp:
+        dirs.append(os.path.join(root, _bank_cache_key({k: v for k, v in fp.items() if k != "tp"})))
+    return dirs
 
 
 def _load_bank_cache(cache_dir: str | None, fp: dict, method, num_layers: int, workers: int, chunk: int, layer_residency):
@@ -380,7 +402,13 @@ def _load_bank_cache(cache_dir: str | None, fp: dict, method, num_layers: int, w
     try:
         with open(os.path.join(cache_dir, INDEX_NAME)) as f:
             stored = json.load(f).get("bank_cache")
-        if stored is None or {k: v for k, v in stored.items() if k != "ggml_types"} != fp:
+        if stored is None:
+            logger.info_rank0(f"expert banks: disk cache stale ({cache_dir})")
+            return None
+        # A TP>1 fingerprint carries "tp" (rank-local banks); a stored full-width
+        # cache matches everything but that field, and load_ftw_banks carves the
+        # rank-local slice out of it on read -- accept both shapes.
+        if {k: v for k, v in stored.items() if k != "ggml_types"} not in (fp, {k: v for k, v in fp.items() if k != "tp"}):
             logger.info_rank0(f"expert banks: disk cache stale ({cache_dir})")
             return None
         banks = load_ftw_banks(
@@ -528,10 +556,11 @@ def load_expert_banks(
             cache_dir = os.path.join(_bank_cache_root(model_path), _bank_cache_key(cache_fp))
         except OSError:
             cache_fp = None  # unstattable / unreadable model dir: skip the cache silently
-    if cache_dir is not None:
-        banks = _load_bank_cache(cache_dir, cache_fp, method, model_config.num_moe_layers, workers, chunk, layer_residency)
-        if banks is not None:
-            return banks
+    if cache_fp is not None:
+        for candidate in _bank_cache_candidates(model_path, cache_fp):
+            banks = _load_bank_cache(candidate, cache_fp, method, model_config.num_moe_layers, workers, chunk, layer_residency)
+            if banks is not None:
+                return banks
 
     if parallel and not _PARALLEL_READER_SUPPORTED:
         logger.warning_rank0(
@@ -578,7 +607,17 @@ def load_expert_banks(
             logger.warning_rank0(f"parallel reader unavailable ({exc}); falling back to serial build")
             banks = _build(False)
     banks = _echo_residency(banks, layer_residency, residency_plan)
-    if cache_dir is not None and not banks.streamed:
+    # TP>1 banks are rank-local (carved intermediate slices) -- never store them over
+    # the full-width cache; future TP1 runs must keep reading the whole store.
+    tp_size = 1
+    try:
+        from freetoken.distributed import try_get_tp_info
+
+        tp = try_get_tp_info()
+        tp_size = tp.size if tp is not None else 1
+    except Exception:
+        pass
+    if cache_dir is not None and not banks.streamed and tp_size == 1:
         _store_bank_cache(cache_dir, cache_fp, banks, model_config.num_moe_layers)
     return banks
 

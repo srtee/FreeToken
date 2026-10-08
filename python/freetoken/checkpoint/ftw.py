@@ -469,6 +469,67 @@ def _split_bank_entries(reader: FTWReader, path: str, num_layers: int):
     return bank_entries, alpha_entries, flat_entries, per_layer_groups
 
 
+def _tp_sharing() -> bool:
+    """Carve rank-local banks out of transient checkpoint windows whenever more
+    than one rank loads the (byte-identical on disk) offload banks: TP > 1."""
+    try:
+        from freetoken.distributed import try_get_tp_info
+
+        tp = try_get_tp_info()
+    except Exception:
+        return False
+    return tp is not None and tp.size > 1
+
+
+
+def _shard_axis(role: str, row_shape: tuple[int, ...]) -> int | None:
+    """The row axis carrying the intermediate dimension, or ``None`` when the bank
+    has none (per-expert scales / globals) and must be replicated under TP.
+
+    Store convention (empirical, nvfp4 FTW converter): ``gate_up*`` rows are
+    ``(2*intermediate, hidden)`` -- ``[gate; up]`` stacked on axis 0 -- while
+    ``down*`` rows are transposed ``(hidden, intermediate)``: the offload kernel's
+    expected local shapes reject anything else (1280x320 vs 2560x160 proven it).
+    ``down_global`` is per-hidden-channel (``(h,)`` per expert): it rides hidden,
+    not intermediate, so it is replicated whole (kernel spec ``BankSpec((h,))``);
+    ``gate_up_global`` is ``(2*intermediate,)`` and rides axis 0 like its bank."""
+    if not row_shape:
+        return None
+    if role.startswith("gate_up"):
+        return 0
+    if role.endswith("_global"):
+        return None
+    return len(row_shape) - 1
+
+
+
+def _tp_carve(win: mmap.mmap, win_len: int, bank: HostBank, role: str, rank: int, tp: int,
+              head_pad: int, layer_bytes: int, num_experts: int,
+              row_shape: tuple[int, ...] | None, dtype, axis: int | None) -> None:
+    """Carve this rank's intermediate slice of one (bank, layer) out of its
+    full-width window into ``bank`` (shaped ``[num_experts, *local_row_shape]``).
+    Banks without an intermediate axis (``axis is None``) are replicated whole."""
+    w = torch.frombuffer(win, dtype=torch.uint8, count=win_len)[head_pad:head_pad + layer_bytes].view(dtype)
+    w = w.view(num_experts, *row_shape) if row_shape else w.view(num_experts)
+    if axis is None:
+        t = torch.frombuffer(bank._buf, dtype=dtype, count=bank.tensor.numel()).view(w.shape)
+        t.copy_(w)
+        return
+    extent = row_shape[axis]
+    i_l = extent // tp
+    lo, hi = rank * i_l, (rank + 1) * i_l
+    local_shape = (num_experts, *(row_shape[:axis] + (i_l,) + tuple(row_shape[axis + 1:])))
+    # banks are built under the engine's inference_mode (main thread); the pool
+    # thread is outside it, so carve through a fresh normal view of the same bytes
+    t = torch.frombuffer(bank._buf, dtype=dtype, count=bank.tensor.numel()).view(local_shape)
+    if role.startswith("gate_up") and len(row_shape) > 1:
+        # [gate; up] stacked on the sharded axis: slice each half
+        halves = w.view(num_experts, 2, extent // 2, *row_shape[1:])
+        th = t.view(num_experts, 2, i_l // 2, *row_shape[1:])
+        th[:, 0].copy_(halves[:, 0, lo // 2:hi // 2])
+        th[:, 1].copy_(halves[:, 1, lo // 2:hi // 2])
+    else:
+        t.copy_(w.moveaxis(1 + axis, -1)[..., lo:hi].moveaxis(-1, 1 + axis))
 def load_ftw_banks(
     path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
     layer_residency: list[str] | None = None,
@@ -476,9 +537,6 @@ def load_ftw_banks(
     """Reconstruct the offload :class:`ExpertBanks` from the FTW's ``experts_bank``
     entries, on the per-layer host bank contract (one ``[num_experts, ...]``
     HostBank per layer per bank; see ``moe.offload_cache.set_bank_sources``).
-
-    ``layer_residency`` (default: all pinned) settles each layer's banks per its ``HostResidency`` label as reads complete: PINNED -> cudaHostRegister, LOCKED -> mlock (CPU-executor resident, no pin quota spent).
-    The applied labels are echoed back on ``ExpertBanks.layer_residency``.
 
     Two on-disk row layouts, distinguished per bank name (a file never mixes them for
     the same name -- checked below):
@@ -493,10 +551,21 @@ def load_ftw_banks(
       via its ALIGNED enclosing window ``[align_down(off), align_up(off+len))`` into a
       page-aligned scratch HostBank, and view the real per-layer tensor as a
       head-offset slice.
+
     * **Per-layer** (streamable-format conversion, see :mod:`freetoken.checkpoint.convert`):
       one entry per ``(bank, layer)``, name ``f"{bank_name}#L{layer_id:05d}"``. Each was
       written by its own ``add_tensor`` call, so its start is already ALIGN-aligned --
       no windowing/head-pad needed, read straight into a HostBank shaped like the entry.
+
+    ``layer_residency`` (default: all pinned) settles each layer's banks per its ``HostResidency`` label as reads complete: PINNED -> cudaHostRegister, LOCKED -> mlock (CPU-executor resident, no pin quota spent).
+    The applied labels are echoed back on ``ExpertBanks.layer_residency``.
+
+    Under TP > 1 (``_tp_sharing``) each rank carves its **intermediate-axis slice**
+    out of a transient MAP_SHARED window of the checkpoint: the full-width layer
+    pages in once (kernel page cache, shared across ranks) and only the rank-local
+    rows are copied into the anonymous bank -- 1/tp of the resident bytes per rank
+    instead of a full copy per rank. Unmapped windows (shard-straddling ranges)
+    raise rather than silently falling back to the OOM-prone full copy.
 
     Alphas (``gate_up_alpha``/``down_alpha``) stay flat ``[num_layers*num_experts]``
     vectors, unaffected by the row split (fixed GPU residency; see
@@ -531,6 +600,11 @@ def load_ftw_banks(
 
     # Alphas: unchanged, one flat HostBank per entry.
     alpha_specs = {e["name"]: (tuple(e["shape"]), _dtype_of(e["dtype"])) for e in alpha_entries}
+    tp = None
+    if _tp_sharing():
+        from freetoken.distributed import get_tp_info
+
+        tp = get_tp_info()
     alpha_hb = alloc_banks(alpha_specs)
 
     # Row banks: one padded-window HostBank per (name, layer_id) for the flat layout, plus
@@ -538,18 +612,21 @@ def load_ftw_banks(
     # a per-layer entry (direct view, no carving needed).
     row_hb: dict[str, list] = {}
     row_view_args: dict[str, list] = {}
-    row_jobs = []  # (name, HostBank, window_off, window_len, layer_bytes) -- flat layout
-    layer_jobs = []  # (name, HostBank, entry) -- per-layer layout, direct aligned read
+    # ``scratch`` slots carry the transient full-width window's BYTE SIZE under TP (the
+    # window itself is one reused thread-local buffer, not a bank per job -- eagerly
+    # allocating every job's window materializes ~all layers at once and OOMs).
+    row_jobs = []  # (name, bank, scratch_nbytes|None, win_off, win_len, head_pad, layer_bytes, num_experts, row_shape, dtype, layer_id)
+    layer_jobs = []  # (name, bank, scratch_nbytes|None, entry, layer_id, row_shape|None)
 
     for e in flat_entries:
         name = e["name"]
-        total, *row_shape = e["shape"]
+        total, *row_shape = tuple(e["shape"])
+        row_shape = tuple(row_shape)
         assert total % num_layers == 0, (name, total, num_layers)
         num_experts = total // num_layers
         dtype = _dtype_of(e["dtype"])
         row_bytes = (math.prod(row_shape) if row_shape else 1) * _elsize(dtype)
         layer_bytes = num_experts * row_bytes
-        assert layer_bytes * num_layers == e["nbytes"], (name, layer_bytes, num_layers, e["nbytes"])
         row_hb[name] = []
         row_view_args[name] = []
         for layer_id in range(num_layers):
@@ -557,10 +634,20 @@ def load_ftw_banks(
             win_off = (off // ALIGN) * ALIGN
             win_end = _align_up(off + layer_bytes)
             head_pad = off - win_off
-            bank = HostBank((win_end - win_off,), torch.uint8, backing=_backing(layer_id))
+            if tp is not None and (axis := _shard_axis(name, row_shape)) is not None:
+                # rank-local bank, carved out of a transient full-width window in _read_row
+                local_row = row_shape[:axis] + (row_shape[axis] // tp.size,) + tuple(row_shape[axis + 1:])
+                bank = HostBank((num_experts, *local_row), dtype, backing=_backing(layer_id))
+                scratch = win_end - win_off  # transient window size; buffer is thread-local
+                row_view_args[name].append(None)
+            else:
+                axis = None
+                bank = HostBank((win_end - win_off,), torch.uint8, backing=_backing(layer_id))
+                scratch = None
+                row_view_args[name].append((head_pad, layer_bytes, num_experts, row_shape, dtype))
             row_hb[name].append(bank)
-            row_view_args[name].append((head_pad, layer_bytes, num_experts, tuple(row_shape), dtype))
-            row_jobs.append((name, bank, win_off, win_end - win_off, layer_bytes, layer_id))
+            row_jobs.append((name, bank, scratch, win_off, win_end - win_off, head_pad,
+                             layer_bytes, num_experts, row_shape, dtype, layer_id, axis))
 
     for base, by_layer in per_layer_groups.items():
         row_hb[base] = []
@@ -568,10 +655,17 @@ def load_ftw_banks(
         for layer_id in range(num_layers):
             e = by_layer[layer_id]
             assert e["global_off"] % ALIGN == 0, (base, layer_id, e["global_off"])  # writer invariant
-            bank = HostBank(tuple(e["shape"]), _dtype_of(e["dtype"]), backing=_backing(layer_id))
+            row_shape = tuple(e["shape"][1:])
+            axis = _shard_axis(base, row_shape) if row_shape else None
+            local_row = None
+            if tp is not None and axis is not None:
+                local_row = row_shape[:axis] + (row_shape[axis] // tp.size,) + row_shape[axis + 1:]
+            shape = (tuple(e["shape"][:1]) + tuple(local_row)) if local_row else tuple(e["shape"])
+            bank = HostBank(shape, _dtype_of(e["dtype"]), backing=_backing(layer_id))
+            scratch = e["nbytes"] if (tp is not None and axis is not None) else None  # transient window; buffer is thread-local
             row_hb[base].append(bank)
             row_view_args[base].append(None)
-            layer_jobs.append((base, bank, e, layer_id))
+            layer_jobs.append((base, bank, scratch, e, layer_id, row_shape, axis))
 
     total_bytes = sum(e["nbytes"] for e in bank_entries)
     bar = byte_bar(total_bytes, "Loading expert banks (FTW)")
@@ -582,6 +676,16 @@ def load_ftw_banks(
     try:
         with PinPipeline() as pins:
 
+            scratch_tls = threading.local()
+
+            def _scratch_bank(nbytes: int):
+                """One reused page-aligned scratch buffer per reader thread."""
+                bank = getattr(scratch_tls, "bank", None)
+                if bank is None or bank.nbytes < nbytes:
+                    bank = HostBank((nbytes,), torch.uint8, backing="mmap")
+                    scratch_tls.bank = bank
+                return bank
+
             def _read_alpha(e):
                 bank = alpha_hb[e["name"]]
                 reader.read_into(bank.memoryview(), e, workers=workers, chunk=chunk)
@@ -589,19 +693,32 @@ def load_ftw_banks(
                 bar.update(e["nbytes"])
 
             def _read_row(job):
-                _name, bank, win_off, win_len, layer_bytes, layer_id = job
-                reader.read_into(bank.memoryview(), {"global_off": win_off, "nbytes": win_len},
+                (name, bank, scratch, win_off, win_len, head_pad, layer_bytes,
+                 num_experts, row_shape, dtype, layer_id, axis) = job
+                dest = bank if scratch is None else _scratch_bank(scratch)
+                reader.read_into(dest.memoryview(), {"global_off": win_off, "nbytes": win_len},
                                  workers=workers, chunk=chunk)
+                if scratch is not None:
+                    _tp_carve(dest._buf, win_len, bank, name, tp.rank, tp.size,
+                              head_pad, layer_bytes, num_experts, row_shape, dtype, axis)
                 pins.submit(bank, residency[layer_id])
                 bar.update(layer_bytes)
 
             def _read_layer(job):
-                _name, bank, entry, layer_id = job
-                reader.read_into(bank.memoryview(), entry, workers=workers, chunk=chunk)
+                base, bank, scratch, entry, layer_id, row_shape, axis = job
+                dest = bank if scratch is None else _scratch_bank(scratch)
+                reader.read_into(dest.memoryview(), entry, workers=workers, chunk=chunk)
+                if scratch is not None:
+                    _tp_carve(dest._buf, entry["nbytes"], bank, base, tp.rank, tp.size,
+                              0, entry["nbytes"], entry["shape"][0], row_shape,
+                              _dtype_of(entry["dtype"]), axis)
                 pins.submit(bank, residency[layer_id])
                 bar.update(entry["nbytes"])
-
-            with ThreadPoolExecutor(min(max(_BANK_CONCURRENCY, 16), max(n_jobs, 1))) as ex:
+            # under TP each reader thread holds a full-width scratch window while it
+            # fills: cap the pool so resident scratch stays a few layers, not all of them
+            pool_workers = (min(_BANK_CONCURRENCY, 4, max(n_jobs, 1)) if tp is not None
+                            else min(max(_BANK_CONCURRENCY, 16), max(n_jobs, 1)))
+            with ThreadPoolExecutor(pool_workers) as ex:
                 futures = [ex.submit(_read_alpha, e) for e in alpha_entries]
                 futures += [ex.submit(_read_row, job) for job in row_jobs]
                 futures += [ex.submit(_read_layer, job) for job in layer_jobs]

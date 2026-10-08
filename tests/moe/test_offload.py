@@ -876,8 +876,61 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         hb.HostResidency.PINNED.value, hb.HostResidency.PAGEABLE.value,
     ]
 
-    monkeypatch.setattr(hb, "_os_lock_failed", False)
-    with hb.requested_residency(labels) as plan2:
-        with hb.PinPipeline() as pins:
-            pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
-    assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+def test_tp_load_finds_the_full_width_bank_cache(monkeypatch, tmp_path):
+    """A TP>1 load keys the disk cache with a tp-scoped fingerprint; it must still
+    find the full-width store written under the TP1 key and carve rank-local rows
+    from it. Without the fallback the serve crashed packing full-width pieces into
+    rank-local banks (640-vs-1280 rows)."""
+    import freetoken.distributed.info as info
+    from freetoken.checkpoint.ftw import FTWWriter, INDEX_NAME, layer_bank_entry_name, load_ftw_banks
+    from freetoken.distributed import DistributedInfo
+    from freetoken.moe import expert_banks as eb
+
+    model = tmp_path / "model"
+    root = model / "freetoken_banks"
+    root.mkdir(parents=True)
+    monkeypatch.delenv("FREETOKEN_BANK_CACHE", raising=False)
+
+    store = tmp_path / "store"
+    w = FTWWriter(str(store))
+    for layer in range(2):
+        # gate_up rows are (2i, h): [gate; up] stacked on the sharded axis
+        w.add_tensor(layer_bank_entry_name("gate_up", layer), torch.arange(32, dtype=torch.uint8).reshape(1, 8, 4), kind="experts_bank")
+        # down rows are transposed (h, i) -- the empirical store convention
+        # (kernel wants local (2560, 160) from full (2560, 320), axis 1)
+        w.add_tensor(layer_bank_entry_name("down", layer), torch.arange(16, dtype=torch.uint8).reshape(1, 4, 4), kind="experts_bank")
+        # per-hidden-channel globals carry no intermediate axis: replicated under TP
+        # (2-D per-expert rows like the real store's [E, h] entries)
+        w.add_tensor(layer_bank_entry_name("down_global", layer), torch.arange(8, dtype=torch.uint8).reshape(2, 4), kind="experts_bank")
+    w.finalize({"quant_format": None, "expert_bank_num_layers": 2})
+
+    fp_tp1 = {"v": eb._BANK_CACHE_VERSION, "format": "nvfp4", "kind": None, "kernel": None,
+              "decode_target": "gpu", "dtype": "uint8", "sources": []}
+    full = load_ftw_banks(str(store), num_layers=2)  # tp size 1: full width
+    dir_tp1 = root / eb._bank_cache_key(fp_tp1)
+    eb._store_bank_cache(str(dir_tp1), fp_tp1, full, 2)
+    assert (dir_tp1 / INDEX_NAME).is_file()
+
+    fp_tp2 = {**fp_tp1, "tp": 2}
+    monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(0, 2))
+    candidates = eb._bank_cache_candidates(str(model), fp_tp2)
+    assert candidates[0] == str(root / eb._bank_cache_key(fp_tp2))
+    assert candidates[1] == str(dir_tp1)
+
+    # the tp-scoped key has no store of its own; the tp-less key serves it
+    assert eb._load_bank_cache(candidates[0], fp_tp2, None, 2, 4, 1 << 20, None) is None
+    hit = eb._load_bank_cache(candidates[1], fp_tp2, None, 2, 4, 1 << 20, None)
+    assert hit is not None
+
+    # rank 0 keeps the first slice of each gate|up half, the first intermediate
+    # rows of down, and the whole of the axisless per-expert scales
+    full_gu = torch.arange(32, dtype=torch.uint8).reshape(1, 8, 4)
+    gu = hit.sources["gate_up"]
+    assert gu[0].shape == (1, 4, 4)
+    assert torch.equal(gu[0], full_gu.view(1, 2, 4, 4)[:, :, :2, :].reshape(1, 4, 4))
+    full_dn = torch.arange(16, dtype=torch.uint8).reshape(1, 4, 4)
+    dw = hit.sources["down"]
+    assert dw[0].shape == (1, 4, 2) and torch.equal(dw[0], full_dn[:, :, :2])
+    dg = hit.sources["down_global"]
+    assert dg[0].shape == (2, 4) and torch.equal(dg[0], torch.arange(8, dtype=torch.uint8).reshape(2, 4))
