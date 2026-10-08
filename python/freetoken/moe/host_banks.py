@@ -114,6 +114,8 @@ class HostBank:
 
     __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked")
 
+
+
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
                  *, backing: str | None = None):
         if backing is None:
