@@ -269,10 +269,12 @@ def _tp_sharder(model_config):
     Replicated on purpose: routers / norms / hyper-connection blocks / indexer
     / PLE (their forward inputs are identical on every rank, so the sparse
     attend selects the same blocks and gathers from local K/V), and the draft
-    head's necks and expert stacks (``.mlp.experts`` is the per-expert axis,
-    never a rank axis). ``model_config`` is the parsed ModelConfig (the dense
-    pass only runs at TP with a parseable checkpoint config); None keeps a
-    unit-test checkpoint's identity stream.
+    head's necks, MLP and expert stacks (``.mlp.experts`` is the per-expert
+    axis, never a rank axis; the draft MoE is LinearReplicated end to end).
+    The draft's attention is the trunk class, so it shards like the trunk.
+    ``model_config`` is the parsed ModelConfig (the dense pass only runs at TP
+    with a parseable checkpoint config); None keeps a unit-test checkpoint's
+    identity stream.
     """
     tp = get_tp_info()
     if tp.size == 1:
@@ -303,6 +305,20 @@ def _tp_sharder(model_config):
                 module = module[: -len(suffix)]
                 break
         if ".mlp.experts." in module or module.endswith(".mlp.gate"):
+            return tensor
+        if module.startswith("model.mtp.") and module.endswith(
+            ("mlp.shared_expert.gate_up_proj", "mlp.shared_expert.down_proj")
+        ):
+            return tensor  # draft shared expert is LinearReplicated
+        if module.startswith("visual.") or ".visual." in module:
+            if module.endswith(".attn.qkv"):
+                # LinearQKVMerged with equal q|k|v head counts: three col-sharded thirds
+                return torch.cat([_col(t) for t in tensor.chunk(3, dim=0)], dim=0).contiguous()
+            if module.endswith((".attn.proj", ".linear_fc2")):
+                # LinearOProj / LinearRowParallel: weight row-sharded, bias replicated
+                return tensor if name.endswith(".bias") else _row(tensor)
+            if module.endswith(".linear_fc1"):
+                return _col(tensor)  # LinearColParallelMerged
             return tensor
         if module.endswith("self_attn.qkv_proj"):
             q, k, v = tensor.split([q_rows, kv_rows, kv_rows], dim=0)
@@ -335,6 +351,13 @@ def _tp_sharder(model_config):
                 b, a = tensor.split([v0, v0], dim=0)
                 rb = slice(rank * vl, (rank + 1) * vl)
                 return torch.cat([b[rb], a[rb]], dim=0).contiguous()
+            if module.endswith("linear_attn.in_proj"):
+                qkv, z, b, a = tensor.split([2 * k0 * kd + v0 * vd, v0 * vd, v0, v0], dim=0)
+                q, k, v = qkv.split([k0 * kd, k0 * kd, v0 * vd], dim=0)
+                r = slice(rank * kl * kd, (rank + 1) * kl * kd)
+                rv = slice(rank * vl * vd, (rank + 1) * vl * vd)
+                rb = slice(rank * vl, (rank + 1) * vl)
+                return torch.cat([q[r], k[r], v[rv], z[rv], b[rb], a[rb]], dim=0).contiguous()
             if module.endswith("linear_attn.conv1d"):
                 rows = torch.cat([torch.arange(rank * 2 * kl * kd, (rank + 1) * 2 * kl * kd),
                                   torch.arange(2 * k0 * kd + rank * vl * vd,

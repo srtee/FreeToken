@@ -293,6 +293,96 @@ def test_shared_expert_gate_up_merge(loaded, checkpoint):
     assert torch.equal(merged[I:], raw[f"{base}.up_proj.weight"])
 
 
+def test_tp_sharder_replicates_the_draft_mlp_but_shards_its_attention(monkeypatch):
+    """The draft head reuses the trunk attention (shard it like the trunk), but
+    its MoE is LinearReplicated end to end -- the fused shared-expert names must
+    ride the replication rules, not the col/row fused-name suffixes."""
+    import freetoken.distributed.info as info
+    from freetoken.distributed import DistributedInfo
+    from freetoken.models.qwen4_exp.weight import _tp_sharder
+
+    class Group:
+        num_key_heads, num_value_heads = 16, 48
+        key_head_dim = value_head_dim = 128
+
+    class Config:
+        head_dim, num_qo_heads, num_kv_heads = 256, 24, 2
+
+        def attention_groups(self):
+            return [Group()]
+
+    gu = torch.randn(1280, 2560)
+    dn = torch.randn(2560, 640)
+    qkv = torch.randn(13312, 2560)  # q 12288 | k 512 | v 512
+    trunk_gu = torch.randn(1280, 2560)
+
+    shards = {}
+    for rank in (0, 1):
+        monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(rank, 2))
+        shard = _tp_sharder(Config())
+        shards[rank] = (
+            shard("model.mtp.layer.mlp.shared_expert.gate_up_proj.weight", gu),
+            shard("model.mtp.layer.mlp.shared_expert.down_proj.weight", dn),
+            shard("model.mtp.layer.self_attn.qkv_proj.weight", qkv),
+            shard("model.layers.0.mlp.shared_expert.gate_up_proj.weight", trunk_gu),
+        )
+
+    # draft MLP replicated byte-identical; attention + trunk expert rank-split
+    assert torch.equal(shards[0][0], shards[1][0]) and shards[0][0].shape == (1280, 2560)
+    assert torch.equal(shards[0][1], shards[1][1]) and shards[0][1].shape == (2560, 640)
+    assert not torch.equal(shards[0][2], shards[1][2])
+    assert not torch.equal(shards[0][3], shards[1][3]) and shards[0][3].shape == (640, 2560)
+    expect0 = torch.cat([qkv[:12288 // 2], qkv[12288:12544], qkv[12800:13056]], dim=0)
+    expect1 = torch.cat([qkv[12288 // 2:12288], qkv[12544:12800], qkv[13056:13312]], dim=0)
+    assert torch.equal(shards[0][2], expect0)
+    assert torch.equal(shards[1][2], expect1)
+
+
+def test_tp_sharder_shards_the_visual_tower(monkeypatch):
+    """Vision is TP-sharded at runtime (div_even heads): qkv col-splits its three
+    equal thirds, proj/fc2 are row-parallel with replicated bias, fc1 col-parallel."""
+    import freetoken.distributed.info as info
+    from freetoken.distributed import DistributedInfo
+    from freetoken.models.qwen4_exp.weight import _tp_sharder
+
+    class Group:
+        num_key_heads, num_value_heads = 16, 48
+        key_head_dim = value_head_dim = 128
+
+    class Config:
+        head_dim, num_qo_heads, num_kv_heads = 256, 24, 2
+
+        def attention_groups(self):
+            return [Group()]
+
+    vh = 1152
+    qkv = torch.randn(3 * vh, vh)
+    proj = torch.randn(vh, vh)
+    fc1 = torch.randn(4 * vh, vh)
+    fc2 = torch.randn(vh, 4 * vh)
+
+    shards = {}
+    for rank in (0, 1):
+        monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(rank, 2))
+        shard = _tp_sharder(Config())
+        shards[rank] = (
+            shard("visual.blocks.0.attn.qkv.weight", qkv),
+            shard("visual.blocks.0.attn.proj.weight", proj),
+            shard("visual.blocks.0.attn.proj.bias", torch.randn(vh)),
+            shard("visual.blocks.0.mlp.linear_fc1.weight", fc1),
+            shard("visual.merger.linear_fc2.weight", fc2),
+        )
+
+    q, k, v = qkv.chunk(3, dim=0)
+    for rank in (0, 1):
+        s = shards[rank]
+        assert torch.equal(s[0], torch.cat([t.chunk(2, dim=0)[rank] for t in (q, k, v)], dim=0))
+        assert torch.equal(s[1], proj.chunk(2, dim=1)[rank])
+        assert s[2].shape == (vh,)  # row-parallel bias replicated
+        assert torch.equal(s[3], fc1.chunk(2, dim=0)[rank])
+        assert torch.equal(s[4], fc2.chunk(2, dim=1)[rank])
+    assert not torch.equal(shards[0][0], shards[1][0])
+
 ZERO_CENTERED = (
     "model.layers.0.attn_hyper_connection.hc_norm.weight",
     "model.layers.0.mlp_hyper_connection.hc_norm.weight",
