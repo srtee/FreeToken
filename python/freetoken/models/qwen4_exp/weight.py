@@ -359,9 +359,15 @@ def _tp_sharder(model_config):
                 rb = slice(rank * vl, (rank + 1) * vl)
                 return torch.cat([q[r], k[r], v[rv], z[rv], b[rb], a[rb]], dim=0).contiguous()
             if module.endswith("linear_attn.conv1d"):
-                rows = torch.cat([torch.arange(rank * 2 * kl * kd, (rank + 1) * 2 * kl * kd),
-                                  torch.arange(2 * k0 * kd + rank * vl * vd,
-                                               2 * k0 * kd + (rank + 1) * vl * vd)])
+                # depthwise over the fused q|k|v channel axis: q and k ride the K
+                # heads, v the V heads — contiguous rank spans would hand rank0's
+                # k-slot q heads' rows (the weight packing is [q_all | k_all | v_all])
+                r = slice(rank * kl * kd, (rank + 1) * kl * kd)
+                rk = slice(k0 * kd + rank * kl * kd, k0 * kd + (rank + 1) * kl * kd)
+                rv = slice(2 * k0 * kd + rank * vl * vd, 2 * k0 * kd + (rank + 1) * vl * vd)
+                rows = torch.cat([torch.arange(r.start, r.stop),
+                                  torch.arange(rk.start, rk.stop),
+                                  torch.arange(rv.start, rv.stop)])
                 return tensor[rows.to(tensor.device)].contiguous()
             if module.endswith(("linear_attn.A_log", "linear_attn.dt_bias")):
                 return tensor[rank * vl:(rank + 1) * vl].contiguous()

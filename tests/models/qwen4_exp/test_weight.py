@@ -383,6 +383,48 @@ def test_tp_sharder_shards_the_visual_tower(monkeypatch):
         assert torch.equal(s[4], fc2.chunk(2, dim=1)[rank])
     assert not torch.equal(shards[0][0], shards[1][0])
 
+
+def test_tp_sharder_splits_gdn_conv1d_q_and_k_blocks(monkeypatch):
+    """conv1d is depthwise over the fused [q_all | k_all | v_all] channel axis; a
+    contiguous rank span hands rank0's k-slot q heads' taps (and rank1's q-slot k
+    heads' taps) at TP2 — the regression behind coherent-mechanics gibberish."""
+    import freetoken.distributed.info as info
+    from freetoken.distributed import DistributedInfo
+    from freetoken.models.qwen4_exp.weight import _tp_sharder
+
+    class Group:
+        num_key_heads, num_value_heads = 16, 48
+        key_head_dim = value_head_dim = 128
+
+    class Config:
+        head_dim, num_qo_heads, num_kv_heads = 256, 24, 2
+
+        def attention_groups(self):
+            return [Group()]
+
+    conv = torch.arange(4 * (2 * 16 * 128 + 48 * 128)).float().reshape(2 * 16 * 128 + 48 * 128, 1, 4)
+    kd = vd = 128
+
+    shards = {}
+    for rank in (0, 1):
+        monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(rank, 2))
+        shards[rank] = _tp_sharder(Config())("model.layers.0.linear_attn.conv1d.weight", conv)
+
+    kl, vl = 8, 24
+    expect = {}
+    for rank in (0, 1):
+        rows = torch.cat([
+            torch.arange(rank * kl * kd, (rank + 1) * kl * kd),                      # q block
+            torch.arange(16 * kd + rank * kl * kd, 16 * kd + (rank + 1) * kl * kd),  # k block
+            torch.arange(2 * 16 * kd + rank * vl * vd, 2 * 16 * kd + (rank + 1) * vl * vd),  # v
+        ])
+        expect[rank] = conv[rows]
+        assert torch.equal(shards[rank], expect[rank])
+    assert shards[0].shape == (2 * kl * kd + vl * vd, 1, 4)
+    # rank0's k-slot holds k heads 0..7's taps, not q heads 8..15's
+    assert torch.equal(shards[0][kl * kd : 2 * kl * kd], conv[16 * kd : 16 * kd + kl * kd])
+
+
 ZERO_CENTERED = (
     "model.layers.0.attn_hyper_connection.hc_norm.weight",
     "model.layers.0.mlp_hyper_connection.hc_norm.weight",
