@@ -88,12 +88,15 @@ def _tp_slice_pieces(pieces, config):
             return t
         scale = name.endswith("_scale")
         base = name[: -len("_scale")] if scale else name
+        # per_expert_pieces yields [e1 - e0, *row_shape]: dim0 is the expert dim,
+        # dim1 the rows (outputs for gate/up/gate_up, hidden for down), tail cols
+        # the K axis (fp4-packed /2 for weights, /GROUP for scales).
         if base == "down":
-            cols = start // 16 if scale else start, end // 16 if scale else end
-            return t[:, cols[0]:cols[1]]
+            cols = start // 2 if not scale else start // 16, end // 2 if not scale else end // 16
+            return t[..., cols[0]:cols[1]]
         if base in ("gate", "up", "gate_up"):
             rows = (2 * start, 2 * end) if base == "gate_up" else (start, end)
-            return t[rows[0]:rows[1]]
+            return t[:, rows[0]:rows[1]]
         raise NotImplementedError(f"NVFP4 expert piece role {name!r} has no TP slice rule")
 
     for bank_layer, e0, e1, piece in pieces:
