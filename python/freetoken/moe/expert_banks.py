@@ -550,10 +550,11 @@ def load_expert_banks(
     # Dummy banks are random and the converter streams banks away -- neither is cacheable.
     cache_dir = None
     cache_fp = None
-    if model_path and not dummy and layer_sink is None:
+    cache_root = _bank_cache_root(model_path) if model_path else None
+    if cache_root is not None and not dummy and layer_sink is None:
         try:
             cache_fp = _bank_cache_fingerprint(model_path, model_config, method, decode_target, dtype)
-            cache_dir = os.path.join(_bank_cache_root(model_path), _bank_cache_key(cache_fp))
+            cache_dir = os.path.join(cache_root, _bank_cache_key(cache_fp))
         except OSError:
             cache_fp = None  # unstattable / unreadable model dir: skip the cache silently
     if cache_fp is not None:

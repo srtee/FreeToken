@@ -934,3 +934,30 @@ def test_tp_load_finds_the_full_width_bank_cache(monkeypatch, tmp_path):
     assert dw[0].shape == (1, 4, 2) and torch.equal(dw[0], full_dn[:, :, :2])
     dg = hit.sources["down_global"]
     assert dg[0].shape == (2, 4) and torch.equal(dg[0], torch.arange(8, dtype=torch.uint8).reshape(2, 4))
+
+
+def test_bank_cache_off_skips_the_load_path_keys(monkeypatch, tmp_path):
+    """``FREETOKEN_BANK_CACHE=off`` disables the disk cache on both paths: the load
+    path must not build cache keys at all -- the old code crashed there with
+    ``os.path.join(None, ...)`` (TypeError) before ever reaching the bank build."""
+    from types import SimpleNamespace
+
+    from freetoken.moe import expert_banks as eb
+
+    model = tmp_path / "model"
+    model.mkdir()
+    monkeypatch.setenv("FREETOKEN_BANK_CACHE", "off")
+    assert eb._bank_cache_root(str(model)) is None
+
+    def _fingerprint_boom(*_args, **_kwargs):
+        raise AssertionError("fingerprint must not run while the cache is disabled")
+
+    monkeypatch.setattr(eb, "_bank_cache_fingerprint", _fingerprint_boom)
+    with pytest.raises(Exception) as exc_info:
+        eb.load_expert_banks(
+            str(model), SimpleNamespace(num_moe_layers=1),
+            device=torch.device("cpu"), dtype=torch.uint8, parallel=False,
+        )
+    # the empty dir's real failure ("no expert tensors") is fine; the cache-seam
+    # TypeError is the regression
+    assert not isinstance(exc_info.value, TypeError)
