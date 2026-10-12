@@ -73,7 +73,8 @@ def _tp_slice_pieces(pieces, config):
     tp = get_tp_info()
     full = config.moe_intermediate_size
     if tp.size == 1:
-        return pieces
+        yield from pieces
+        return
     i_local = full // tp.size
     if full % tp.size or i_local % 16:
         raise NotImplementedError(
@@ -176,6 +177,7 @@ def iter_nvfp4_expert_pieces(
         per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9),
         config,
     )
+
 
 
 __all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]
