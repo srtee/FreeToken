@@ -263,11 +263,19 @@ def cached_load_hf_config(
         return build_gguf_shim(gguf_src)
     config = _load_hf_config(model_path)
     data = config.to_dict()
+    none_overrides: dict[str, Any] = {}
     if overrides:
         data = _with_overrides(config, data, overrides)
+        # Sub-config-bearing classes re-default falsy sections at __init__
+        # (transformers auto-instantiates registered sub-configs), so a None-valued
+        # override can't survive the to_dict/reconstruct round trip; re-apply after.
+        none_overrides = {k: None for k, v in overrides.items() if v is None}
     if isinstance(config, RawConfigShim):
         return RawConfigShim(data)
-    return type(config)(**data)
+    built = type(config)(**data)
+    if none_overrides:
+        built.update(none_overrides)
+    return built
 
 
 def _weight_allow_patterns(repo_id: str) -> list[str]:

@@ -32,3 +32,12 @@ def test_hf_overrides_load_as_if_the_checkpoint_config_said_so(tmp_path, model_t
     assert overrides == requested
     # a fresh copy each time: the override never reaches the cached checkpoint config
     assert cached_load_hf_config(checkpoint).text_config.rope_parameters["rope_type"] == "default"
+
+
+def test_none_override_survives_subconfig_reconstruction(tmp_path):
+    # transformers v5 auto-instantiates registered sub-configs (Qwen4ExpConfig always builds a
+    # default vision_config), so a None-valued override cannot survive the to_dict/reconstruct
+    # round trip by plain merging; it is re-applied after construction.
+    checkpoint = _checkpoint(tmp_path / "checkpoint", "qwen4_exp", "bfloat16", {"rope_type": "default", "rope_theta": 1e6})
+    assert cached_load_hf_config(checkpoint).vision_config is not None
+    assert cached_load_hf_config(checkpoint, {"vision_config": None}).vision_config is None
