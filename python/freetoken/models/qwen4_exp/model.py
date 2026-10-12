@@ -127,8 +127,19 @@ class Qwen4ExpModel(BaseOP):
             meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
             for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
                 ple.start_prefetch(batch, meta)
-        for layer in self.layers.op_list:
+        import os as _os
+        _dump = _os.environ.get("FT_TP2_DEBUG")
+        for i, layer in enumerate(self.layers.op_list):
             hidden = layer.forward(hidden, batch)
+            if _dump and not torch.cuda.is_current_stream_capturing():
+                import hashlib as _hl
+                from freetoken.distributed import info as _info
+                _f = hidden.detach().float()
+                with open(_dump, "a") as _fh:
+                    _fh.write(f"rank={_info.get_tp_info().rank} L={i} "
+                              f"sha={_hl.sha256(_f.cpu().numpy().tobytes()).hexdigest()[:16]} "
+                              f"norm={round(float(_f.pow(2).mean().sqrt()), 6)} "
+                              f"head={[round(v, 4) for v in _f[0, :5].tolist()]}\n")
         if meta is not None:
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window

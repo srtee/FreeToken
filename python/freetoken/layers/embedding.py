@@ -146,4 +146,17 @@ class ParallelLMHead(VocabParallelEmbedding):
         output_tensor = output_tensor.view((self.tp_size,) + input_shape)
         output_tensor = output_tensor.permute(1, 0, 2).contiguous()
         output_tensor = output_tensor.reshape(input_shape[:1] + (self.tp_size * input_shape[1],))
-        return output_tensor[:, : self.num_embeddings]
+        logits = output_tensor[:, : self.num_embeddings]
+        import os as _os
+        if _os.environ.get("FT_TP2_DEBUG") and not torch.cuda.is_current_stream_capturing():
+            from freetoken.distributed import info as _info
+            import hashlib as _hl
+            _tp = _info.get_tp_info()
+            _f = logits.detach().float().cpu()
+            with open(_os.environ["FT_TP2_DEBUG"], "a") as _fh:
+                _fh.write(f"rank={_tp.rank} bs={bs} prefill={batch.is_prefill} "
+                          f"sha={_hl.sha256(_f.numpy().tobytes()).hexdigest()[:16]} "
+                          f"argmax={int(_f.argmax(-1).max())} "
+                          f"head={[round(v, 4) for v in _f[0, :5].tolist()]} "
+                          f"max={round(float(_f.max()), 4)}\n")
+        return logits
