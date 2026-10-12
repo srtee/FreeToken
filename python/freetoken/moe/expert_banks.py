@@ -299,7 +299,10 @@ def ftw_bank_bytes(model_path: str) -> int | None:
 # FREETOKEN_BANK_CACHE: unset -> <model_path>/freetoken_banks; a path overrides
 # the root; "off"/"0" disables. Dummy banks and the converter (layer_sink) never
 # touch it.
-_BANK_CACHE_VERSION = 1
+# v2: v1 caches predate the global/block-scale layout the triton NVFP4 kernel now
+# consumes; their gate_up_scale/gate_up_global bytes are not interpretable today
+# (fingerprint axes -- kernel, dtype, shapes -- cannot tell them apart).
+_BANK_CACHE_VERSION = 2
 
 
 def _bank_cache_root(model_path: str) -> str | None:
