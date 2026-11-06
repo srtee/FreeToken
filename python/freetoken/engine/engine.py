@@ -703,6 +703,7 @@ class Engine:
                 config.model_config,
                 method=layers[0].quant_method,
                 device=self.device,
+                dtype=self.dtype,
                 dummy=config.use_dummy_weight,
                 parallel={"serial": False, "parallel": True}.get(config.expert_load, None),
                 resident=True,
@@ -828,8 +829,10 @@ class Engine:
                     config.model_config,
                     method=method,
                     device=self.device,
+                    dtype=self.dtype,
                     dummy=config.use_dummy_weight,
                     parallel=expert_parallel,
+                    decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                     layer_residency=requested_residency,
                     layer_methods=layer_methods,
                 )
