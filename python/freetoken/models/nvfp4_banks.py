@@ -95,7 +95,11 @@ def _tp_slice_pieces(pieces, config):
     tp = get_tp_info()
     full = config.moe_intermediate_size
     if tp.size == 1:
-        return pieces
+        # _tp_slice_pieces is a generator (the TP>1 branch yields below): a bare
+        # ``return pieces`` would end THIS generator without ever pulling ``pieces``
+        # and every TP=1 NVFP4 load would silently see zero experts.
+        yield from pieces
+        return
     i_local = full // tp.size
     if full % tp.size or i_local % 16:
         raise NotImplementedError(
