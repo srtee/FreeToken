@@ -129,6 +129,12 @@ def load_args(hf_config: Any) -> Glm5NextArgs:
         raise ValueError(
             f"layer_types has {len(layer_types)} entries for {num_layers} layers"
         )
+    # transformers 5.17 names GLM DSA layers "deepseek_sparse_attention"; 5.18
+    # renamed them "indexed_attention" (DSA_LAYER). Normalize both so a checkpoint
+    # parse doesn't depend on the installed version.
+    layer_types = tuple(
+        DSA_LAYER if t == "deepseek_sparse_attention" else t for t in layer_types
+    )
     unknown = sorted(set(layer_types) - {KDA_LAYER, DSA_LAYER})
     if unknown:
         raise ValueError(f"unsupported layer_types entries: {unknown}")
